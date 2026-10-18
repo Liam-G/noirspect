@@ -73,6 +73,8 @@ runs:
     - name: Fail on findings
       if: inputs.fail-on-findings == 'true' && steps.lint.outputs.exit-code == '2'
       shell: bash
+      env:
+        SARIF_FILE: ${{ inputs.sarif-file }}
       run: |
-        echo "::error::noirspect reported findings; see the code scanning alerts or ${{ inputs.sarif-file }}"
+        echo "::error::noirspect reported findings; see the code scanning alerts or ${SARIF_FILE}"
         exit 2
