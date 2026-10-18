@@ -17,7 +17,7 @@ clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 toml = "0.8"
-num-bigint = "0.4"
+num-bigint = "0.5"
 num-traits = "0.2"
 
 # Noir compiler crates, pinned to the nargo release this version supports.
