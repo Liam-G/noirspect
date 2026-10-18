@@ -1,0 +1,16 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    # The Noir compiler crates are pinned to one nargo release on purpose;
+    # bump them by hand together with the supported nargo version.
+    ignore:
+      - dependency-name: "nargo*"
+      - dependency-name: "noirc_*"
+      - dependency-name: "fm"
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

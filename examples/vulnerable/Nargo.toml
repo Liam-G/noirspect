@@ -1,0 +1,6 @@
+[package]
+name = "vulnerable"
+type = "bin"
+authors = ["noirspect"]
+
+[dependencies]

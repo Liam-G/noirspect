@@ -1,0 +1,33 @@
+[package]
+name = "noirspect"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "Static analyzer for under-constrained values in Noir zero-knowledge circuits"
+license = "MIT"
+authors = ["Liam Giannini, Webcracy.ch"]
+repository = "https://github.com/Liam-G/noirspect"
+homepage = "https://webcracy.ch"
+keywords = ["noir", "zero-knowledge", "security", "linter", "sarif"]
+categories = ["command-line-utilities", "development-tools"]
+readme = "README.md"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+toml = "0.8"
+num-bigint = "0.4"
+num-traits = "0.2"
+
+# Noir compiler crates, pinned to the nargo release this version supports.
+nargo = { git = "https://github.com/noir-lang/noir", tag = "v1.0.0-beta.26" }
+nargo_toml = { git = "https://github.com/noir-lang/noir", tag = "v1.0.0-beta.26" }
+noirc_driver = { git = "https://github.com/noir-lang/noir", tag = "v1.0.0-beta.26" }
+noirc_evaluator = { git = "https://github.com/noir-lang/noir", tag = "v1.0.0-beta.26" }
+noirc_frontend = { git = "https://github.com/noir-lang/noir", tag = "v1.0.0-beta.26" }
+noirc_errors = { git = "https://github.com/noir-lang/noir", tag = "v1.0.0-beta.26" }
+fm = { git = "https://github.com/noir-lang/noir", tag = "v1.0.0-beta.26" }
+
+[profile.release]
+lto = "thin"

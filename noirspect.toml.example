@@ -1,0 +1,7 @@
+[noirspect]
+format = "sarif"
+min-severity = "medium"
+disable = ["NUC-008"]
+enable = ["NUC-007"]
+entry = "auto"
+entry-timeout = 120

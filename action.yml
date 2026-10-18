@@ -1,0 +1,78 @@
+name: noirspect
+description: Find under-constrained values in Noir circuits and report them to GitHub code scanning.
+author: Liam Giannini, Webcracy.ch
+branding:
+  icon: shield
+  color: purple
+
+inputs:
+  program-dir:
+    description: Directory containing Nargo.toml.
+    default: "."
+  args:
+    description: Extra arguments for `noirspect lint`, such as `--workspace` or `--disable NUC-008`.
+    default: ""
+  version:
+    description: noirspect release tag to install.
+    default: v0.1.0
+  sarif-file:
+    description: Where to write the SARIF report.
+    default: noirspect.sarif
+  upload-sarif:
+    description: Upload the report to GitHub code scanning (needs `security-events: write`).
+    default: "true"
+  fail-on-findings:
+    description: Fail the job when noirspect reports findings.
+    default: "true"
+
+outputs:
+  exit-code:
+    description: "noirspect's exit code: 0 clean, 2 findings, 1 error."
+    value: ${{ steps.lint.outputs.exit-code }}
+
+runs:
+  using: composite
+  steps:
+    - name: Restore noirspect
+      id: cache
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/bin/noirspect
+        key: noirspect-${{ inputs.version }}-${{ runner.os }}-${{ runner.arch }}
+
+    - name: Install noirspect
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+      run: cargo install --locked --git https://github.com/Liam-G/noirspect --tag "$VERSION" noirspect
+
+    - name: Run noirspect
+      id: lint
+      shell: bash
+      env:
+        PROGRAM_DIR: ${{ inputs.program-dir }}
+        SARIF_FILE: ${{ inputs.sarif-file }}
+        EXTRA_ARGS: ${{ inputs.args }}
+      run: |
+        set +e
+        # shellcheck disable=SC2086 # EXTRA_ARGS is a list of flags
+        noirspect lint --program-dir "$PROGRAM_DIR" --format sarif --output "$SARIF_FILE" $EXTRA_ARGS
+        code=$?
+        echo "exit-code=$code" >> "$GITHUB_OUTPUT"
+        if [ "$code" -eq 1 ]; then exit 1; fi
+        exit 0
+
+    - name: Upload to code scanning
+      if: inputs.upload-sarif == 'true'
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: ${{ inputs.sarif-file }}
+        category: noirspect
+
+    - name: Fail on findings
+      if: inputs.fail-on-findings == 'true' && steps.lint.outputs.exit-code == '2'
+      shell: bash
+      run: |
+        echo "::error::noirspect reported findings; see the code scanning alerts or ${{ inputs.sarif-file }}"
+        exit 2
