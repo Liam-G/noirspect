@@ -404,6 +404,20 @@ struct Session {
     child: Child,
     stdin: std::process::ChildStdin,
     lines: mpsc::Receiver<String>,
+    lowered: usize,
+}
+
+/// The compiler keeps memory from every entry a worker lowers, so a worker is
+/// replaced once it grows past this (Linux, where its size can be read) ...
+const WORKER_RECYCLE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// ... or after this many entries everywhere.
+const WORKER_RECYCLE_ENTRIES: usize = 32;
+
+/// Resident memory of a process, where the platform exposes it.
+fn resident_bytes(pid: u32) -> Option<u64> {
+    let statm = std::fs::read_to_string(format!("/proc/{pid}/statm")).ok()?;
+    let pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
+    Some(pages * 4096)
 }
 
 impl Session {
@@ -446,6 +460,7 @@ impl Session {
             child,
             stdin,
             lines,
+            lowered: 0,
         };
         // Loading and checking the crate counts against the same time budget.
         let header = session
@@ -509,6 +524,12 @@ impl Session {
         let _ = self.child.wait();
     }
 
+    /// Whether the worker has grown enough that a fresh one would be cheaper.
+    fn worn_out(&self) -> bool {
+        self.lowered >= WORKER_RECYCLE_ENTRIES
+            || resident_bytes(self.child.id()).is_some_and(|bytes| bytes > WORKER_RECYCLE_BYTES)
+    }
+
     fn finish(mut self) {
         drop(self.stdin);
         let _ = self.child.wait();
@@ -552,7 +573,15 @@ fn lower_in_workers(
                         }
                     };
                     let lowered = match outcome {
-                        Ok(lowered) => lowered,
+                        Ok(lowered) => {
+                            if let Some(running) = session.as_mut() {
+                                running.lowered += 1;
+                                if running.worn_out() {
+                                    session.take().expect("running session").finish();
+                                }
+                            }
+                            lowered
+                        }
                         Err(error) => {
                             if let Some(mut dead) = session.take() {
                                 dead.kill();
