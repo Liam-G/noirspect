@@ -60,7 +60,7 @@ impl Rule {
     }
 }
 
-pub const RULES: [Rule; 8] = [
+pub const RULES: [Rule; 9] = [
     Rule {
         id: "NUC-001",
         title: "Constant-only check",
@@ -125,6 +125,14 @@ pub const RULES: [Rule; 8] = [
         summary: "A `// Safety:` comment gives no reason why the unconstrained call is sound.",
         remediation: "Say which constraints check the hint's results, so a reviewer can verify them.",
     },
+    Rule {
+        id: "NUC-009",
+        title: "One-directional bound",
+        severity: Severity::Medium,
+        default_enabled: true,
+        summary: "A hint result is tied to its inputs only by comparisons that all point the same way, so the prover can return any larger (or any smaller) value.",
+        remediation: "Bound the result from both sides (for a square root, `r * r <= y` and `y < (r + 1) * (r + 1)`), or pin it with an equality (for a maximum, `(m == a) | (m == b)`).",
+    },
 ];
 
 pub fn rule(id: &str) -> Option<&'static Rule> {
@@ -146,6 +154,8 @@ pub struct Finding {
     /// The function the finding was found in, as an analysis entry point.
     pub entry: String,
     pub package: String,
+    /// Stable across edits that do not touch the flagged line; see `--baseline`.
+    pub fingerprint: String,
     #[serde(skip)]
     pub escapes: bool,
 }
@@ -189,6 +199,7 @@ impl Ctx<'_, '_> {
             related,
             entry: String::new(),
             package: String::new(),
+            fingerprint: String::new(),
             escapes,
         });
     }
@@ -228,6 +239,7 @@ pub fn check_function(g: &Graph) -> Vec<Finding> {
         inverse_only_is_zero(&mut ctx, hint);
         unchecked_index(&mut ctx, hint);
         half_checked_sort(&mut ctx, hint);
+        one_directional_bound(&mut ctx, hint);
     }
     for c in &g.constraints {
         if c.kind == ConstraintKind::Equal {
@@ -628,6 +640,112 @@ fn inverse_only_is_zero(ctx: &mut Ctx, hint: &HintCall) {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Bound {
+    Upper,
+    Lower,
+}
+
+/// The direction in which constraint `c` bounds the hint's values, when `c`
+/// asserts a comparison with the hint on one side only and the hint side
+/// grows with the hint's values (all its hint terms have positive weight).
+fn comparison_bound(g: &Graph, c: usize, call: usize) -> Option<Bound> {
+    let Kind::Constrain { lhs, rhs, .. } = &g.instrs[c].kind else {
+        return None;
+    };
+    let (value, expected) = match (lhs, rhs) {
+        (Operand::Val(v), Operand::Const { value, .. })
+        | (Operand::Const { value, .. }, Operand::Val(v)) => (*v, !value.is_zero()),
+        _ => return None,
+    };
+    let (mut holds, mut v) = (expected, value);
+    if let Some(Kind::Not(Operand::Val(inner))) = g.def(v).map(|i| &i.kind) {
+        holds = !holds;
+        v = *inner;
+    }
+    let Some(Kind::Binary {
+        op: BinOp::Lt,
+        lhs: a,
+        rhs: b,
+        ..
+    }) = g.def(v).map(|i| &i.kind)
+    else {
+        return None;
+    };
+    let (hint_on_a, hint_on_b) = (
+        g.touches_call(&g.leaves_of(a), call),
+        g.touches_call(&g.leaves_of(b), call),
+    );
+    let increasing = |side: &Operand| {
+        g.linear(side).terms.iter().all(|(atom, coeff)| {
+            !g.atom_leaves(atom)
+                .iter()
+                .any(|l| l.hint_call() == Some(call))
+                || coeff.is_positive()
+        })
+    };
+    // `a < b` holds when `holds`, otherwise `a >= b`.
+    match (hint_on_a, hint_on_b) {
+        (true, false) if increasing(a) => Some(if holds { Bound::Upper } else { Bound::Lower }),
+        (false, true) if increasing(b) => Some(if holds { Bound::Lower } else { Bound::Upper }),
+        _ => None,
+    }
+}
+
+/// NUC-009: every constraint tying the hint to its inputs is a comparison in the same direction.
+fn one_directional_bound(ctx: &mut Ctx, hint: &HintCall) {
+    let g = ctx.g;
+    if !has_live_args(g, hint) {
+        return;
+    }
+    let used_as_index = g.instrs.iter().any(|i| {
+        matches!(&i.kind, Kind::ArrayGet { index, .. } if g.touches_call(&g.leaves_of(index), hint.instr))
+    });
+    if used_as_index {
+        return;
+    }
+    let linking: Vec<_> = g
+        .constraints
+        .iter()
+        .filter(|c| {
+            !c.bounds_check
+                && g.touches_call(&c.leaves, hint.instr)
+                && c.leaves.iter().any(|l| l.hint_call() != Some(hint.instr))
+        })
+        .collect();
+    let mut directions = BTreeSet::new();
+    for c in &linking {
+        match comparison_bound(g, c.instr, hint.instr) {
+            Some(bound) => directions.insert(bound == Bound::Upper),
+            None => return,
+        };
+    }
+    if directions.len() != 1 {
+        return;
+    }
+    let upper = directions.contains(&true);
+    let related = ctx.related(
+        linking[0].instr,
+        if upper {
+            "only bounded from above here"
+        } else {
+            "only bounded from below here"
+        },
+    );
+    ctx.push(
+        "NUC-009",
+        hint,
+        format!(
+            "the result of `{}` is only bounded from {} by its inputs, so the prover can return any {} value",
+            hint.callee,
+            if upper { "above" } else { "below" },
+            if upper { "smaller" } else { "larger" },
+        ),
+        related,
+        false,
+    );
+}
+
 /// NUC-005: a hint index reads an array, but nothing compares the element read to the needle.
 fn unchecked_index(ctx: &mut Ctx, hint: &HintCall) {
     let g = ctx.g;
@@ -799,6 +917,7 @@ fn narrowing_casts(ctx: &mut Ctx) {
             related: Vec::new(),
             entry: String::new(),
             package: String::new(),
+            fingerprint: String::new(),
             escapes: false,
         });
     }

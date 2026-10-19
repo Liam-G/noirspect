@@ -24,6 +24,8 @@ pub struct AnalysisOptions {
     pub rules: BTreeSet<&'static str>,
     /// Lower entries in worker processes with a time budget; `None` lowers in-process.
     pub worker: Option<Worker>,
+    /// Fingerprints of accepted findings (from an earlier JSON report) to leave out.
+    pub baseline: BTreeSet<String>,
 }
 
 impl AnalysisOptions {
@@ -41,6 +43,7 @@ impl AnalysisOptions {
                 .map(|r| r.id)
                 .collect(),
             worker: None,
+            baseline: BTreeSet::new(),
         }
     }
 }
@@ -60,6 +63,8 @@ pub struct Analysis {
     pub findings: Vec<Finding>,
     /// Entry points the compiler could not lower to SSA; they are skipped.
     pub skipped: Vec<EntryError>,
+    /// Findings left out because the baseline already accepted them.
+    pub baselined: usize,
 }
 
 pub fn analyze(options: &AnalysisOptions) -> Result<Analysis, String> {
@@ -164,7 +169,11 @@ pub fn analyze_loaded(workspace: &WorkspaceSsa, options: &AnalysisOptions) -> An
                 .and_then(|l| sources.get(l.file.as_str()))
                 .is_some_and(|text| source::is_suppressed(f, text))
     });
-    let findings = dedupe(findings);
+    let mut findings = dedupe(findings);
+    assign_fingerprints(&mut findings, &sources);
+    let before = findings.len();
+    findings.retain(|f| !options.baseline.contains(&f.fingerprint));
+    let baselined = before - findings.len();
 
     Analysis {
         root: workspace.root.clone(),
@@ -172,7 +181,43 @@ pub fn analyze_loaded(workspace: &WorkspaceSsa, options: &AnalysisOptions) -> An
         entries_analyzed,
         findings,
         skipped,
+        baselined,
     }
+}
+
+/// Fingerprint each finding by rule, file and the text of its line (plus an
+/// occurrence count for identical lines), so edits elsewhere in the file keep
+/// it stable while a change to the flagged line itself makes it new again.
+fn assign_fingerprints(findings: &mut [Finding], sources: &HashMap<&str, &str>) {
+    let mut seen: HashMap<(String, String, String), usize> = HashMap::new();
+    for f in findings.iter_mut() {
+        let (file, text) = match &f.loc {
+            Some(loc) => {
+                let line = sources
+                    .get(loc.file.as_str())
+                    .and_then(|t| t.lines().nth(loc.line.saturating_sub(1) as usize))
+                    .unwrap_or_default();
+                (
+                    loc.file.clone(),
+                    line.split_whitespace().collect::<Vec<_>>().join(" "),
+                )
+            }
+            None => (String::new(), f.message.clone()),
+        };
+        let key = (f.rule.to_string(), file, text);
+        let occurrence = seen.entry(key.clone()).or_default();
+        *occurrence += 1;
+        f.fingerprint = format!(
+            "{:016x}",
+            fnv1a(&format!("{}\0{}\0{}\0{occurrence}", key.0, key.1, key.2))
+        );
+    }
+}
+
+fn fnv1a(text: &str) -> u64 {
+    text.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
 }
 
 /// Printed SSA locations are relative to the workspace root or absolute.

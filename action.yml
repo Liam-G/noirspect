@@ -10,16 +10,16 @@ inputs:
     description: Directory containing Nargo.toml.
     default: "."
   args:
-    description: Extra arguments for `noirspect lint`, such as `--workspace` or `--disable NUC-008`.
+    description: Extra arguments for `noirspect lint`, such as `--workspace` or `--baseline noirspect-baseline.json`.
     default: ""
   version:
     description: noirspect release tag to install.
-    default: v0.1.0
+    default: v0.2.0
   sarif-file:
     description: Where to write the SARIF report.
     default: noirspect.sarif
   upload-sarif:
-    description: Upload the report to GitHub code scanning (needs `security-events: write`).
+    description: "Upload the report to GitHub code scanning (needs `security-events: write`)."
     default: "true"
   fail-on-findings:
     description: Fail the job when noirspect reports findings.
@@ -35,9 +35,9 @@ runs:
   steps:
     - name: Restore noirspect
       id: cache
-      uses: actions/cache@v4
+      uses: actions/cache@v6
       with:
-        path: ~/.cargo/bin/noirspect
+        path: ~/.noirspect/bin
         key: noirspect-${{ inputs.version }}-${{ runner.os }}-${{ runner.arch }}
 
     - name: Install noirspect
@@ -45,7 +45,29 @@ runs:
       shell: bash
       env:
         VERSION: ${{ inputs.version }}
-      run: cargo install --locked --git https://github.com/Liam-G/noirspect --tag "$VERSION" noirspect
+      run: |
+        set -euo pipefail
+        case "$RUNNER_OS-$RUNNER_ARCH" in
+          Linux-X64) target=x86_64-unknown-linux-gnu ;;
+          Linux-ARM64) target=aarch64-unknown-linux-gnu ;;
+          macOS-ARM64) target=aarch64-apple-darwin ;;
+          *) target= ;;
+        esac
+        mkdir -p "$HOME/.noirspect/bin"
+        archive="noirspect-$VERSION-$target.tar.gz"
+        base="https://github.com/Liam-G/noirspect/releases/download/$VERSION"
+        if [ -n "$target" ] && curl -fsSL -o "$RUNNER_TEMP/$archive" "$base/$archive" \
+            && curl -fsSL -o "$RUNNER_TEMP/$archive.sha256" "$base/$archive.sha256"; then
+          (cd "$RUNNER_TEMP" && shasum -a 256 -c "$archive.sha256")
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$HOME/.noirspect/bin"
+        else
+          echo "No prebuilt binary for $RUNNER_OS-$RUNNER_ARCH; building from source."
+          cargo install --locked --git https://github.com/Liam-G/noirspect --tag "$VERSION" --root "$HOME/.noirspect" noirspect
+        fi
+
+    - name: Add noirspect to PATH
+      shell: bash
+      run: echo "$HOME/.noirspect/bin" >> "$GITHUB_PATH"
 
     - name: Run noirspect
       id: lint
@@ -65,7 +87,7 @@ runs:
 
     - name: Upload to code scanning
       if: inputs.upload-sarif == 'true'
-      uses: github/codeql-action/upload-sarif@v3
+      uses: github/codeql-action/upload-sarif@v4
       with:
         sarif_file: ${{ inputs.sarif-file }}
         category: noirspect

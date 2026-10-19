@@ -89,6 +89,8 @@ pub struct WorkspaceSsa {
 pub struct Worker {
     pub exe: PathBuf,
     pub timeout: Duration,
+    /// Worker processes to run at once.
+    pub jobs: usize,
 }
 
 pub struct LoadOptions<'a> {
@@ -346,13 +348,13 @@ struct WorkerPlan {
 }
 
 /// Entry point of the hidden `__lower` subcommand: plan `package` exactly as
-/// the parent did, then lower entries from `start` on, one JSON line each.
+/// the parent did, print the plan, then lower each entry index read from stdin
+/// and answer with one JSON line, until stdin closes.
 pub fn worker_main(
     program_dir: &Path,
     package: &str,
     entry: EntryMode,
     function_filter: Option<&str>,
-    start: usize,
 ) -> Result<(), String> {
     on_compiler_thread(|| {
         let loaded = load_workspace(program_dir, Some(package), false)?;
@@ -364,78 +366,74 @@ pub fn worker_main(
         let mut prepared = PreparedPackage::new(&loaded, package)?;
         let plan = prepared.plan(entry, function_filter);
         let mut stdout = std::io::stdout().lock();
+        let mut send = |line: String| {
+            writeln!(stdout, "{line}")
+                .and_then(|_| stdout.flush())
+                .map_err(|e| e.to_string())
+        };
         let header = WorkerPlan {
             plan: plan.iter().map(|e| e.name.clone()).collect(),
         };
-        let header = serde_json::to_string(&header).map_err(|e| e.to_string())?;
-        writeln!(stdout, "{header}")
-            .and_then(|_| stdout.flush())
-            .map_err(|e| e.to_string())?;
-        for (index, planned) in plan.iter().enumerate().skip(start) {
-            let lowered = prepared.lower_entry(planned);
-            let (ssa, error) = match lowered.ssa {
+        send(serde_json::to_string(&header).map_err(|e| e.to_string())?)?;
+        for line in std::io::stdin().lock().lines() {
+            let line = line.map_err(|e| e.to_string())?;
+            let Some(planned) = line
+                .trim()
+                .parse::<usize>()
+                .ok()
+                .and_then(|i| plan.get(i).map(|p| (i, p)))
+            else {
+                continue;
+            };
+            let (index, planned) = planned;
+            let (ssa, error) = match prepared.lower_entry(planned).ssa {
                 Ok(ssa) => (Some(ssa), None),
                 Err(e) => (None, Some(e)),
             };
-            let line = serde_json::to_string(&WorkerLine { index, ssa, error })
-                .map_err(|e| e.to_string())?;
-            writeln!(stdout, "{line}")
-                .and_then(|_| stdout.flush())
-                .map_err(|e| e.to_string())?;
+            send(
+                serde_json::to_string(&WorkerLine { index, ssa, error })
+                    .map_err(|e| e.to_string())?,
+            )?;
         }
         Ok(())
     })
 }
 
-fn spawn_worker(
-    worker: &Worker,
-    options: &LoadOptions,
-    package: &Package,
-    start: usize,
-) -> Result<Child, String> {
-    let mut command = Command::new(&worker.exe);
-    command
-        .arg("__lower")
-        .arg("--program-dir")
-        .arg(options.program_dir)
-        .arg("--package")
-        .arg(package.name.to_string())
-        .arg("--entry")
-        .arg(options.entry.as_arg())
-        .arg("--start")
-        .arg(start.to_string());
-    if let Some(filter) = options.function_filter {
-        command.arg("--function").arg(filter);
-    }
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("cannot start worker {}: {e}", worker.exe.display()))
+/// A running worker process that lowers the entries it is sent.
+struct Session {
+    child: Child,
+    stdin: std::process::ChildStdin,
+    lines: mpsc::Receiver<String>,
 }
 
-/// Lower `plan` in worker processes; an entry over budget is killed and skipped.
-fn lower_in_workers(
-    worker: &Worker,
-    options: &LoadOptions,
-    package: &Package,
-    plan: &[PlannedEntry],
-) -> Vec<EntrySsa> {
-    let mut results: Vec<Option<Result<String, String>>> = vec![None; plan.len()];
-    let mut next = 0;
-    while next < plan.len() {
-        let mut child = match spawn_worker(worker, options, package, next) {
-            Ok(child) => child,
-            Err(e) => {
-                results[next..]
-                    .iter_mut()
-                    .for_each(|r| *r = Some(Err(e.clone())));
-                break;
-            }
-        };
+impl Session {
+    fn start(
+        worker: &Worker,
+        options: &LoadOptions,
+        package: &Package,
+        plan: &[PlannedEntry],
+    ) -> Result<Session, String> {
+        let mut command = Command::new(&worker.exe);
+        command
+            .arg("__lower")
+            .arg("--program-dir")
+            .arg(options.program_dir)
+            .arg("--package")
+            .arg(package.name.to_string())
+            .arg("--entry")
+            .arg(options.entry.as_arg());
+        if let Some(filter) = options.function_filter {
+            command.arg("--function").arg(filter);
+        }
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("cannot start worker {}: {e}", worker.exe.display()))?;
+        let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
-        let (sender, receiver) = mpsc::channel();
+        let (sender, lines) = mpsc::channel();
         std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines() {
                 let Ok(line) = line else { break };
@@ -444,56 +442,134 @@ fn lower_in_workers(
                 }
             }
         });
+        let mut session = Session {
+            child,
+            stdin,
+            lines,
+        };
+        // Loading and checking the crate counts against the same time budget.
+        let header = session
+            .lines
+            .recv_timeout(worker.timeout)
+            .ok()
+            .and_then(|line| serde_json::from_str::<WorkerPlan>(&line).ok());
+        let expected: Vec<&str> = plan.iter().map(|e| e.name.as_str()).collect();
+        match header {
+            Some(header) if header.plan == expected => Ok(session),
+            Some(_) => {
+                session.kill();
+                Err(
+                    "the worker planned different entry points (was noirspect rebuilt mid-run?)"
+                        .to_string(),
+                )
+            }
+            None => {
+                session.kill();
+                Err("the worker did not start".to_string())
+            }
+        }
+    }
+
+    /// Lower one entry; `Err` means the worker is gone (timed out or crashed).
+    fn lower(&mut self, index: usize, timeout: Duration) -> Result<Result<String, String>, String> {
+        if writeln!(self.stdin, "{index}")
+            .and_then(|_| self.stdin.flush())
+            .is_err()
+        {
+            return Err("the compiler crashed on this entry".to_string());
+        }
         loop {
-            match receiver.recv_timeout(worker.timeout) {
+            match self.lines.recv_timeout(timeout) {
                 Ok(line) => {
-                    if let Ok(header) = serde_json::from_str::<WorkerPlan>(&line) {
-                        let expected: Vec<&str> = plan.iter().map(|e| e.name.as_str()).collect();
-                        if header.plan != expected {
-                            let _ = child.kill();
-                            let error = "the worker planned different entry points (was noirspect rebuilt mid-run?)";
-                            results[next..]
-                                .iter_mut()
-                                .for_each(|r| *r = Some(Err(error.to_string())));
-                            next = plan.len();
-                            break;
-                        }
-                        continue;
-                    }
                     let Ok(parsed) = serde_json::from_str::<WorkerLine>(&line) else {
                         continue;
                     };
-                    if parsed.index < plan.len() {
-                        results[parsed.index] = Some(match (parsed.ssa, parsed.error) {
+                    if parsed.index == index {
+                        return Ok(match (parsed.ssa, parsed.error) {
                             (Some(ssa), _) => Ok(ssa),
                             (None, error) => Err(error.unwrap_or_default()),
                         });
-                        next = parsed.index + 1;
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    let _ = child.kill();
-                    results[next] = Some(Err(format!(
+                    return Err(format!(
                         "lowering took longer than {}s; skipped",
-                        worker.timeout.as_secs()
-                    )));
-                    next += 1;
-                    break;
+                        timeout.as_secs()
+                    ));
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    // The worker exited: either done, or it crashed on entry `next`.
-                    if next < plan.len() && results[next].is_none() {
-                        results[next] = Some(Err("the compiler crashed on this entry".to_string()));
-                        next += 1;
-                    }
-                    break;
+                    return Err("the compiler crashed on this entry".to_string());
                 }
             }
         }
-        let _ = child.wait();
     }
+
+    fn kill(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+
+    fn finish(mut self) {
+        drop(self.stdin);
+        let _ = self.child.wait();
+    }
+}
+
+/// Lower `plan` in up to `worker.jobs` long-lived worker processes, handing
+/// out one entry at a time so slow entries do not hold up the others. An
+/// entry over budget kills its worker, is skipped, and a fresh worker takes
+/// over the rest of that job's share.
+fn lower_in_workers(
+    worker: &Worker,
+    options: &LoadOptions,
+    package: &Package,
+    plan: &[PlannedEntry],
+) -> Vec<EntrySsa> {
+    let jobs = worker.jobs.clamp(1, plan.len().max(1));
+    let queue = std::sync::Mutex::new((0..plan.len()).rev().collect::<Vec<_>>());
+    let results = std::sync::Mutex::new(vec![None::<Result<String, String>>; plan.len()]);
+    let fatal = std::sync::Mutex::new(None::<String>);
+    std::thread::scope(|scope| {
+        for _ in 0..jobs {
+            scope.spawn(|| {
+                let mut session: Option<Session> = None;
+                while let Some(index) = queue.lock().expect("queue lock").pop() {
+                    let outcome = if let Some(error) = fatal.lock().expect("fatal lock").clone() {
+                        Err(error)
+                    } else if let Some(running) = session.as_mut() {
+                        running.lower(index, worker.timeout)
+                    } else {
+                        match Session::start(worker, options, package, plan) {
+                            Ok(mut started) => {
+                                let outcome = started.lower(index, worker.timeout);
+                                session = Some(started);
+                                outcome
+                            }
+                            Err(error) => {
+                                *fatal.lock().expect("fatal lock") = Some(error.clone());
+                                Err(error)
+                            }
+                        }
+                    };
+                    let lowered = match outcome {
+                        Ok(lowered) => lowered,
+                        Err(error) => {
+                            if let Some(mut dead) = session.take() {
+                                dead.kill();
+                            }
+                            Err(error)
+                        }
+                    };
+                    results.lock().expect("results lock")[index] = Some(lowered);
+                }
+                if let Some(running) = session {
+                    running.finish();
+                }
+            });
+        }
+    });
     plan.iter()
-        .zip(results)
+        .zip(results.into_inner().expect("results lock"))
         .map(|(entry, ssa)| EntrySsa {
             name: entry.name.clone(),
             is_main: entry.is_main,

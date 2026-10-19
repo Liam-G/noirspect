@@ -15,11 +15,13 @@ and the line of the weak check.
 
 ## Quick start
 
-Requires Rust 1.89 or newer. `nargo` is not needed: noirspect builds the
-compiler crates of nargo 1.0.0-beta.26 into itself.
+Download a prebuilt binary for Linux (x86_64, arm64) or macOS (arm64) from the
+[latest release](https://github.com/Liam-G/noirspect/releases/latest), or build
+from source with Rust 1.89 or newer. `nargo` is not needed either way:
+noirspect builds the compiler crates of nargo 1.0.0-beta.26 into itself.
 
 ```console
-cargo install --locked --path .
+cargo install --locked --git https://github.com/Liam-G/noirspect --tag v0.2.0
 noirspect lint --program-dir examples/vulnerable
 echo $?  # 2: findings were reported
 
@@ -55,6 +57,7 @@ noirspect lint --workspace --format sarif --output noirspect.sarif
 | [NUC-006](docs/rules/NUC-006.md) Half-checked sort | medium | on | A hinted sort checked for order but not permutation, or the reverse |
 | [NUC-007](docs/rules/NUC-007.md) Narrowing cast of an unchecked Field | medium | off | `x as u8` on a `Field` that is never range checked |
 | [NUC-008](docs/rules/NUC-008.md) Empty safety comment | info | on | `// Safety:` comments that give no reason |
+| [NUC-009](docs/rules/NUC-009.md) One-directional bound | medium | on | A hint bounded from one side only (`r * r <= y` for a square root) |
 
 `noirspect rules` prints the same list. Rules for Aztec contracts (note
 ownership, nullifiers, private/public boundaries) are planned as a separate
@@ -82,8 +85,9 @@ Entry points (`--entry`):
 
 Each entry point is compiled in a worker process with a time budget
 (`--entry-timeout`, 120 seconds by default; 0 compiles in-process with no
-limit). An entry that runs over budget, or that the compiler cannot lower, is
-listed as skipped in every report format rather than failing the run.
+limit), with up to `--jobs` workers at once (the CPU count, at most 4, by
+default). An entry that runs over budget, or that the compiler cannot lower,
+is listed as skipped in every report format rather than failing the run.
 
 Use `noirspect ssa --program-dir DIR --function NAME` to see the SSA a rule
 runs on.
@@ -101,16 +105,30 @@ jobs:
       contents: read
       security-events: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: Liam-G/noirspect@v0.1.0
+      - uses: actions/checkout@v7
+      - uses: Liam-G/noirspect@v0.2.0
         with:
           program-dir: circuits
           args: --workspace
 ```
 
-The first run compiles noirspect, which takes a few minutes; later runs use
-the cached binary. SARIF paths are relative to the directory noirspect runs
-in, so they resolve in code scanning when `program-dir` is a subdirectory.
+The Action downloads the release binary for the runner and checks its SHA-256
+checksum; on other platforms it builds noirspect from source. SARIF paths are
+relative to the directory noirspect runs in, so they resolve in code scanning
+when `program-dir` is a subdirectory.
+
+### Adopting on existing code
+
+Accept today's findings once, commit the report, and fail CI only on new ones:
+
+```console
+noirspect lint --workspace --format json --output noirspect-baseline.json
+noirspect lint --workspace --baseline noirspect-baseline.json
+```
+
+A finding's fingerprint is its rule, its file and the text of the flagged line,
+so edits elsewhere in the file keep it accepted. Changing the flagged line
+itself makes it a new finding to review.
 
 ### Exit codes
 
@@ -134,6 +152,8 @@ format = "sarif"
 min-severity = "medium"
 disable = ["NUC-008"]
 entry-timeout = 300
+jobs = 4
+baseline = "noirspect-baseline.json"
 ```
 
 ```console
@@ -156,8 +176,8 @@ let i = unsafe { find_hint(keys, key) };
 A linter is only kept switched on if its findings are usually real, so
 precision is measured from the start.
 
-**Seeded suite.** [`tests/corpus`](tests/corpus) holds 42 vulnerable circuits
-and 40 correct look-alikes, at least 5 of each per rule. `cargo test` requires
+**Seeded suite.** [`tests/corpus`](tests/corpus) holds 47 vulnerable circuits
+and 45 correct look-alikes, at least 5 of each per rule. `cargo test` requires
 every vulnerable circuit to be flagged with exactly its rule, and no
 look-alike to be flagged at all. Both hold.
 
@@ -168,13 +188,13 @@ by hand:
 
 | Outcome | Mutants |
 |---|---:|
-| Flagged by noirspect | 25 |
+| Flagged by noirspect | 31 |
 | Not under-constrained (the deleted check was redundant) | 6 |
-| Hint result left with no constraint at all, which the compiler reports (3 spot-checked with `nargo compile`) | 12 |
-| Missed: weak checks no v1 rule covers (inequality-only bounds, a weakened multiset check) | 7 |
+| Hint result left with no constraint at all, which the compiler reports (3 spot-checked with `nargo compile`) | 9 |
+| Missed by both: a partial `max` check, a weakened multiset check | 4 |
 
-Of the 44 mutants that are under-constrained, noirspect flags 25, the
-compiler's own check reports 12 others, and 7 are caught by neither.
+Of the 44 mutants that are under-constrained, noirspect flags 31 (25 in 0.1),
+the compiler's own check reports 9 others, and 4 are caught by neither.
 
 **Real-world runs.** Run with all rules on, including NUC-007, on the Noir
 standard library and libraries from Noir's own external-library CI. All
@@ -192,7 +212,8 @@ packages ran to completion.
 | noir-bignum | 915 | 44 | 39 s |
 
 Skipped entry points are functions the compiler cannot lower as an entry point,
-or that ran over the time budget.
+or that ran over the time budget. Times are from 0.1, which compiled entry points
+one at a time; 0.2 compiles them in parallel (`--jobs`).
 
 Findings in third-party code are triaged by hand and, when real, reported
 privately to the maintainers first. Per-rule precision on public code will be

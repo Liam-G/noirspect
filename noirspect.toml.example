@@ -5,3 +5,5 @@ disable = ["NUC-008"]
 enable = ["NUC-007"]
 entry = "auto"
 entry-timeout = 120
+jobs = 4
+baseline = "noirspect-baseline.json"

@@ -1,0 +1,6 @@
+[package]
+name = "nuc009"
+type = "lib"
+authors = ["noirspect"]
+
+[dependencies]

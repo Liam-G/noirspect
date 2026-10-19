@@ -73,6 +73,7 @@ pub fn empty_safety_comments(file: &str, text: &str) -> Vec<Finding> {
             related: Vec::new(),
             entry: String::new(),
             package: String::new(),
+            fingerprint: String::new(),
             escapes: false,
         });
     }

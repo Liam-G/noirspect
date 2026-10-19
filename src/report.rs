@@ -31,6 +31,9 @@ pub fn text_report(analysis: &Analysis) -> String {
         format!("entry points analyzed: {}", analysis.entries_analyzed),
         format!("findings: {}", analysis.findings.len()),
     ];
+    if analysis.baselined > 0 {
+        lines.push(format!("left out by the baseline: {}", analysis.baselined));
+    }
     for f in &analysis.findings {
         let rule = f.rule();
         lines.push(String::new());
@@ -70,6 +73,7 @@ pub fn json_report(analysis: &Analysis) -> Value {
     summary.insert("packages".into(), json!(analysis.packages.len()));
     summary.insert("entry_points".into(), json!(analysis.entries_analyzed));
     summary.insert("findings".into(), json!(analysis.findings.len()));
+    summary.insert("baselined".into(), json!(analysis.baselined));
     for severity in [
         Severity::High,
         Severity::Medium,
@@ -103,6 +107,7 @@ pub fn json_report(analysis: &Analysis) -> Value {
                 "entry": if f.entry.is_empty() { None } else { Some(&f.entry) },
                 "remediation": rule.remediation,
                 "help_uri": rule.help_uri(),
+                "fingerprint": f.fingerprint,
             })
         })
         .collect();
@@ -194,8 +199,7 @@ pub fn sarif_report(analysis: &Analysis) -> Value {
             });
             if let Some(loc) = &f.loc {
                 let uri = sarif_uri(analysis, &loc.file);
-                result["partialFingerprints"] =
-                    json!({ "primaryLocationLineHash": format!("{}:{uri}:{}", rule.id, loc.line) });
+                result["partialFingerprints"] = json!({ "noirspect/v1": f.fingerprint });
                 result["locations"] = json!([sarif_location(&uri, loc.line, loc.col)]);
             }
             if !f.related.is_empty() {

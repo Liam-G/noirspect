@@ -95,7 +95,8 @@ fn sarif_report_is_code_scanning_shaped() {
     assert_eq!(sarif["version"], "2.1.0");
     let run = &sarif["runs"][0];
     assert_eq!(run["tool"]["driver"]["name"], "noirspect");
-    assert_eq!(run["tool"]["driver"]["rules"].as_array().unwrap().len(), 8);
+    assert_eq!(run["tool"]["driver"]["rules"].as_array().unwrap().len(), 9);
+    assert!(run["results"][0]["partialFingerprints"]["noirspect/v1"].is_string());
     let result = &run["results"][0];
     assert_eq!(result["level"], "error");
     let location = &result["locations"][0]["physicalLocation"];
@@ -177,11 +178,89 @@ fn ignore_comments_suppress_findings() {
 }
 
 #[test]
+fn baseline_leaves_out_accepted_findings() {
+    let dir = tempdir("baseline");
+    copy_dir(&example("vulnerable"), &dir);
+    let baseline = dir.join("baseline.json");
+    let first = lint(
+        &dir,
+        &["--format", "json", "--output", baseline.to_str().unwrap()],
+    );
+    assert_eq!(first.status.code(), Some(2));
+
+    // Unrelated edits above the findings move every line but keep the fingerprints.
+    let main = dir.join("src/main.nr");
+    let source = std::fs::read_to_string(&main).unwrap();
+    std::fs::write(
+        &main,
+        format!("// a new header line\n// and another\n{source}"),
+    )
+    .unwrap();
+    let accepted = lint(
+        &dir,
+        &["--format", "json", "--baseline", baseline.to_str().unwrap()],
+    );
+    assert_eq!(
+        accepted.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&accepted.stdout)
+    );
+    let report: Value = serde_json::from_slice(&accepted.stdout).unwrap();
+    assert_eq!(report["summary"]["baselined"], 4);
+
+    // A new bug is still reported.
+    let source = std::fs::read_to_string(&main).unwrap().replace(
+        "fn main(",
+        "unconstrained fn inv_hint(x: Field) -> Field { 1 / x }\n\nfn check_inv(x: Field) {\n    // Safety: checked\n    let inv = unsafe { inv_hint(x) };\n    assert(inv != 0);\n}\n\nfn main(",
+    );
+    let source = source.replace(
+        "    (div(n, d), is_zero(x), to_bits(byte))",
+        "    check_inv(x);\n    (div(n, d), is_zero(x), to_bits(byte))",
+    );
+    std::fs::write(&main, source).unwrap();
+    let regressed = lint(
+        &dir,
+        &["--format", "json", "--baseline", baseline.to_str().unwrap()],
+    );
+    assert_eq!(regressed.status.code(), Some(2));
+    let report: Value = serde_json::from_slice(&regressed.stdout).unwrap();
+    assert_eq!(rule_ids(&report), ["NUC-001"]);
+
+    let not_a_report = dir.join("Nargo.toml");
+    let bad = lint(&dir, &["--baseline", not_a_report.to_str().unwrap()]);
+    assert_eq!(bad.status.code(), Some(1));
+}
+
+#[test]
+fn parallel_jobs_match_a_sequential_run() {
+    let corpus = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus/nuc003");
+    let ids = |jobs: &str| {
+        let out = lint(&corpus, &["--format", "json", "--jobs", jobs]);
+        let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| {
+                (
+                    f["line"].as_u64().unwrap(),
+                    f["fingerprint"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let sequential = ids("1");
+    assert_eq!(sequential.len(), 5);
+    assert_eq!(ids("3"), sequential);
+}
+
+#[test]
 fn rules_command_lists_catalogue() {
     let out = noirspect(&["rules"]);
     assert_eq!(out.status.code(), Some(0));
     let text = String::from_utf8(out.stdout).unwrap();
-    assert_eq!(text.lines().count(), 8);
+    assert_eq!(text.lines().count(), 9);
     assert!(text.contains("NUC-007\tmedium\toff\tNarrowing cast of an unchecked Field"));
 }
 

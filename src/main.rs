@@ -45,8 +45,6 @@ struct LowerArgs {
     entry: EntryMode,
     #[arg(long)]
     function: Option<String>,
-    #[arg(long)]
-    start: usize,
 }
 
 #[derive(clap::Args)]
@@ -92,6 +90,12 @@ struct LintArgs {
     /// Skip an entry point whose compilation takes longer than this; 0 waits forever
     #[arg(long, value_name = "SECONDS")]
     entry_timeout: Option<u64>,
+    /// Compile this many entry points in parallel (default: CPU count, at most 4)
+    #[arg(long, value_name = "N")]
+    jobs: Option<usize>,
+    /// Leave out findings already in this earlier JSON report
+    #[arg(long, value_name = "REPORT")]
+    baseline: Option<PathBuf>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -105,9 +109,37 @@ struct Policy {
     enable: Vec<String>,
     entry: Option<EntryMode>,
     entry_timeout: Option<u64>,
+    jobs: Option<usize>,
+    baseline: Option<PathBuf>,
 }
 
 const DEFAULT_ENTRY_TIMEOUT_SECONDS: u64 = 120;
+const MAX_DEFAULT_JOBS: usize = 4;
+
+/// Fingerprints of the findings in an earlier `--format json` report.
+fn load_baseline(path: &Path) -> Result<BTreeSet<String>, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read baseline {}: {e}", path.display()))?;
+    let report: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| format!("baseline {} is not a JSON report: {e}", path.display()))?;
+    let findings = report["findings"].as_array().ok_or_else(|| {
+        format!(
+            "baseline {} has no findings list; write it with --format json",
+            path.display()
+        )
+    })?;
+    findings
+        .iter()
+        .map(|f| {
+            f["fingerprint"].as_str().map(str::to_string).ok_or_else(|| {
+                format!(
+                    "baseline {} has findings without fingerprints; regenerate it with noirspect 0.2 or later",
+                    path.display()
+                )
+            })
+        })
+        .collect()
+}
 
 #[derive(Deserialize)]
 struct PolicyFile {
@@ -178,12 +210,24 @@ fn lint(args: &LintArgs) -> Result<ExitCode, String> {
         .entry_timeout
         .or(policy.entry_timeout)
         .unwrap_or(DEFAULT_ENTRY_TIMEOUT_SECONDS);
+    let jobs = args.jobs.or(policy.jobs).unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .map_or(1, |n| n.get())
+            .min(MAX_DEFAULT_JOBS)
+    });
+    if jobs == 0 {
+        return Err("--jobs must be at least 1".to_string());
+    }
     if timeout > 0 {
         let exe = std::env::current_exe().map_err(|e| format!("cannot locate noirspect: {e}"))?;
         options.worker = Some(Worker {
             exe,
             timeout: Duration::from_secs(timeout),
+            jobs,
         });
+    }
+    if let Some(path) = args.baseline.as_deref().or(policy.baseline.as_deref()) {
+        options.baseline = load_baseline(path)?;
     }
 
     let analysis = analyze(&options)?;
@@ -239,7 +283,6 @@ fn main() -> ExitCode {
             &args.package,
             args.entry,
             args.function.as_deref(),
-            args.start,
         )
         .map(|()| ExitCode::SUCCESS),
     };
