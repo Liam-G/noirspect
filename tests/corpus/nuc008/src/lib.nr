@@ -69,3 +69,13 @@ pub fn safe_5(x: Field) {
     let inv = unsafe { inv_hint(x) };
     assert(inv * x == 1);
 }
+
+// The look-alikes accept honest witnesses (run with `nargo test`).
+#[test]
+fn honest_inputs_pass() {
+    safe_1(5);
+    safe_2(5);
+    safe_3(5);
+    safe_4(5);
+    safe_5(5);
+}

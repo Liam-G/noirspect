@@ -18,10 +18,11 @@ and the line of the weak check.
 Download a prebuilt binary for Linux (x86_64, arm64) or macOS (arm64) from the
 [latest release](https://github.com/Liam-G/noirspect/releases/latest), or build
 from source with Rust 1.89 or newer. `nargo` is not needed either way:
-noirspect builds the compiler crates of nargo 1.0.0-beta.26 into itself.
+noirspect builds the compiler crates of nargo 1.0.0-rc.5 into itself
+(`noirspect --version` names the release).
 
 ```console
-cargo install --locked --git https://github.com/Liam-G/noirspect --tag v0.2.1
+cargo install --locked --git https://github.com/Liam-G/noirspect --tag v0.3.0
 noirspect lint --program-dir examples/vulnerable
 echo $?  # 2: findings were reported
 
@@ -51,13 +52,13 @@ noirspect lint --workspace --format sarif --output noirspect.sarif
 |---|---|---|---|
 | [NUC-001](docs/rules/NUC-001.md) Constant-only check | high | on | A hint result only ever compared to constants (`assert(ok)` on a "verify" hint) |
 | [NUC-002](docs/rules/NUC-002.md) Missing remainder bound | high | on | `q * d + r == n` without `r < d` |
-| [NUC-003](docs/rules/NUC-003.md) Unchecked decomposition | high | on | Bits or limbs recombined into an input without a range check to their width |
+| [NUC-003](docs/rules/NUC-003.md) Unchecked decomposition | high | on | Bits or limbs recombined into an input without a range check to their width, or wide enough to wrap past the field modulus |
 | [NUC-004](docs/rules/NUC-004.md) One-sided is-zero | high | on | Only one of `x * flag == 0` and `x * inv == 1 - flag` |
 | [NUC-005](docs/rules/NUC-005.md) Unchecked index | medium | on | A hinted index whose element is never compared to the needle |
-| [NUC-006](docs/rules/NUC-006.md) Half-checked sort | medium | on | A hinted sort checked for order but not permutation, or the reverse |
+| [NUC-006](docs/rules/NUC-006.md) Half-checked sort | medium | on | A hinted sort checked for order but not permutation, or the reverse; hinted indices that may repeat; too few power sums |
 | [NUC-007](docs/rules/NUC-007.md) Narrowing cast of an unchecked Field | medium | off | `x as u8` on a `Field` that is never range checked |
 | [NUC-008](docs/rules/NUC-008.md) Empty safety comment | info | on | `// Safety:` comments that give no reason |
-| [NUC-009](docs/rules/NUC-009.md) One-directional bound | medium | on | A hint bounded from one side only (`r * r <= y` for a square root) |
+| [NUC-009](docs/rules/NUC-009.md) One-directional bound | medium | on | A hint bounded from one side only (`r * r <= y` for a square root), or a `max` compared with only some of its candidates |
 
 `noirspect rules` prints the same list. Rules for Aztec contracts (note
 ownership, nullifiers, private/public boundaries) are planned as a separate
@@ -80,7 +81,8 @@ Entry points (`--entry`):
   references or vectors, cannot be lowered on their own. noirspect analyzes
   each of their concrete instantiations, found in callers and `#[test]`
   functions. In library mode a value that is returned unchecked is not
-  reported for NUC-002, NUC-003 and NUC-005, because the caller may check it.
+  reported for NUC-001, NUC-002, NUC-003 and NUC-005, because the caller may
+  check it.
 - `all` applies the library behavior to binaries too; `main` analyzes `main` only.
 
 Each entry point is compiled in a worker process with a time budget
@@ -113,7 +115,7 @@ jobs:
       security-events: write
     steps:
       - uses: actions/checkout@v7
-      - uses: Liam-G/noirspect@v0.2.1
+      - uses: Liam-G/noirspect@v0.3.0
         with:
           program-dir: circuits
           args: --workspace
@@ -183,46 +185,70 @@ let i = unsafe { find_hint(keys, key) };
 A linter is only kept switched on if its findings are usually real, so
 precision is measured from the start.
 
-**Seeded suite.** [`tests/corpus`](tests/corpus) holds 47 vulnerable circuits
-and 45 correct look-alikes, at least 5 of each per rule. `cargo test` requires
+**Seeded suite.** [`tests/corpus`](tests/corpus) holds 52 vulnerable circuits
+and 47 correct look-alikes, at least 5 of each per rule. `cargo test` requires
 every vulnerable circuit to be flagged with exactly its rule, and no
 look-alike to be flagged at all. Both hold.
 
+The suite is checked with nargo itself in CI. Every look-alike runs on honest
+inputs, and [`tests/exploits`](tests/exploits) gets a wrong witness past five
+of the vulnerable circuits and shows their fixes rejecting it: a wrong
+quotient, a second decomposition past the modulus, a different multiset with
+the same sum and sum of squares, a sort made of one repeated element, and a
+"maximum" that is the smaller input. An audit for 0.3 found that four
+look-alikes in earlier versions were themselves under-constrained; they are
+now vulnerable cases that the rules flag, next to sound look-alikes.
+
 **Mutation recall.** [`scripts/mutation_recall.py`](scripts/mutation_recall.py)
 deletes one assertion at a time from the correct look-alikes of NUC-001 to
-NUC-006 and checks whether noirspect flags the mutant. Of 50 mutants, triaged
-by hand:
+NUC-006 and NUC-009 and checks whether noirspect flags the mutant. Of 72
+mutants, triaged by hand:
 
 | Outcome | Mutants |
 |---|---:|
-| Flagged by noirspect | 31 |
-| Not under-constrained (the deleted check was redundant) | 6 |
-| Hint result left with no constraint at all, which the compiler reports (3 spot-checked with `nargo compile`) | 9 |
-| Missed by both: a partial `max` check, a weakened multiset check | 4 |
+| Flagged by noirspect | 52 |
+| Not under-constrained: the deleted check was redundant (7), or the hint result is returned for the caller to check (1) | 8 |
+| Hint result left with no constraint at all, which the compiler reports | 9 |
+| Missed by both: a decomposition whose recombination or half of its modulus check is deleted, and a halving checked only by an underflow | 3 |
 
-Of the 44 mutants that are under-constrained, noirspect flags 31 (25 in 0.1),
-the compiler's own check reports 9 others, and 4 are caught by neither.
+Of the 64 mutants that are under-constrained, noirspect flags 52 (31 of 44 in
+0.2, 25 in 0.1), the compiler's own check reports 9 others, and 3 are caught
+by neither.
 
 **Real-world runs.** Run with all rules on, including NUC-007, on the Noir
-standard library and libraries from Noir's own external-library CI. All
-packages ran to completion.
+standard library and every library in Noir's own external-library CI, at the
+commits that CI pins.
 
 | Package | Entry points | Skipped | Time |
 |---|---:|---:|---:|
-| Noir standard library (beta.26) | 447 | 28 | 13 s |
-| noir_sort | 3 | 0 | 1 s |
+| Noir standard library (rc.5) | 465 | 10 | 4 s |
 | noir_check_shuffle | 4 | 0 | 1 s |
-| noir_string_search | 11 | 0 | 1 s |
-| sparse_array | 16 | 2 | 1 s |
+| eddsa | 3 | 0 | 3 s |
+| mimc | 3 | 1 | 1 s |
+| schnorr | 6 | 0 | 1 s |
+| noir_sort | 3 | 0 | 1 s |
+| noir-edwards | 16 | 0 | 2 s |
+| noir-bignum | 959 | 0 | 102 s |
+| noir_bigcurve | 259 | 0 | 9.7 min |
 | noir_base64 | 19 | 0 | 8 s |
-| noir_json_parser | 104 | 10 (4 over the time budget) | 9.5 min |
-| noir-bignum | 915 | 44 | 61 s |
+| noir_string_search | 11 | 0 | 2 s |
+| sparse_array | 18 | 0 | 1 s |
+| noir_json_parser | 114 | 0 | 9.5 min |
+| sha256 | 19 | 1 | 3 s |
+| sha512 | 34 | 0 | 77 s |
+| keccak256 | 9 | 0 | 1 s |
+| poseidon | 76 | 4 | 9 s |
+| Aztec protocol circuits: blob | 32 | 1 (over the time budget) | 5.5 min |
+| Aztec protocol circuits: types | 572 | 7 | 75 s |
+| Aztec protocol circuits: private kernel | 364 | 21 | 15.5 min |
 
-Measured with 0.2.1 and the default `--jobs` (4) on a 14-core machine with
+Measured with 0.3.0 and the default `--jobs` (4) on a 14-core machine with
 30 GB of memory. Skipped entry points are functions the compiler cannot lower
-as an entry point, or that ran over the time budget. noir_json_parser's time
-is dominated by four benchmark circuits that each need around 10 GB and more
-than 120 seconds to compile, so they run one at a time and are then skipped.
+as an entry point on their own (loop bounds or array sizes that depend on a
+parameter), or that ran over the time budget. Seven more libraries in that CI
+list (zk_regex, web_authn, noir_jwt, zkemail, tdd and zkpassport's RSA and
+ECDSA) do not compile with nargo 1.0.0-rc.5 at the pinned commits, with nargo
+itself as with noirspect.
 
 Findings in third-party code are triaged by hand and, when real, reported
 privately to the maintainers first. Per-rule precision on public code will be
@@ -233,7 +259,7 @@ arithmetic), which is why it is off by default.
 ## Limitations
 
 - noirspect supports exactly one nargo version per release (currently
-  1.0.0-beta.26), because the compiler's internal crates change between betas.
+  1.0.0-rc.5), because the compiler's internal crates change between releases.
   A package that requires a different compiler version may not compile.
 - The analysis is heuristic. It recognizes specific weak-check patterns; a
   check written in an unusual form can be missed or mistaken for a bound. It

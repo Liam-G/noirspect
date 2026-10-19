@@ -1,9 +1,9 @@
 //! The rule catalogue and the SSA-level rules.
 
 use crate::graph::{
-    Atom, Constraint, ConstraintKind, Graph, HintCall, HintSlice, Leaf, Leaves, ratio_bits,
+    Atom, Constraint, ConstraintKind, Graph, HintCall, HintSlice, Leaf, Leaves, Linear, ratio_bits,
 };
-use crate::ssa::{BinOp, Kind, Loc, Operand, int_bits, is_array, is_field};
+use crate::ssa::{BinOp, Instr, Kind, Loc, Operand, Val, array_len, int_bits, is_array, is_field};
 use num_bigint::BigInt;
 use num_traits::{Signed, Zero};
 use serde::Serialize;
@@ -84,8 +84,8 @@ pub const RULES: [Rule; 9] = [
         title: "Unchecked decomposition",
         severity: Severity::High,
         default_enabled: true,
-        summary: "Limbs or bits from a hint are recombined into an input, but a limb is not range checked to its width, so the decomposition is not unique.",
-        remediation: "Range check every limb to its width (`assert_max_bit_size`, a `u8`/`bool` hint return type, or `b * (1 - b) == 0` for bits).",
+        summary: "Limbs or bits from a hint are recombined into an input, but a limb is not range checked to its width, or the limbs reach past the field modulus, so the decomposition is not unique.",
+        remediation: "Range check every limb to its width (`assert_max_bit_size`, a `u8`/`bool` hint return type, or `b * (1 - b) == 0` for bits); when the limbs reach 254 bits, also compare them to the modulus, as `std::field::bn254::decompose` does.",
     },
     Rule {
         id: "NUC-004",
@@ -108,8 +108,8 @@ pub const RULES: [Rule; 9] = [
         title: "Half-checked sort",
         severity: Severity::Medium,
         default_enabled: true,
-        summary: "A sorted array from a hint is checked for order but not shown to be a permutation of the input (or the reverse).",
-        remediation: "Check both properties: adjacent elements are ordered, and the output is a permutation of the input (for example with a hinted index map checked element by element).",
+        summary: "A sorted array from a hint is checked for order but not shown to be a permutation of the input (or the reverse), or the permutation check is too weak: hinted indices that may repeat, or fewer power sums than elements.",
+        remediation: "Check both properties: adjacent elements are ordered, and the output is a permutation of the input (a hinted index map with distinct indices, the sums of powers 1 to n, or a product check at a challenge derived from both arrays).",
     },
     Rule {
         id: "NUC-007",
@@ -132,7 +132,7 @@ pub const RULES: [Rule; 9] = [
         title: "One-directional bound",
         severity: Severity::Medium,
         default_enabled: true,
-        summary: "A hint result is tied to its inputs only by comparisons that all point the same way, so the prover can return any larger (or any smaller) value.",
+        summary: "A hint result is tied to its inputs only by comparisons that all point the same way, or pinned to one of several values but compared with only some of them, so the prover can return a larger (or smaller) value than intended.",
         remediation: "Bound the result from both sides (for a square root, `r * r <= y` and `y < (r + 1) * (r + 1)`), or pin it with an equality (for a maximum, `(m == a) | (m == b)`).",
     },
 ];
@@ -217,6 +217,20 @@ impl<'g> Ctx<'g, '_> {
         })
     }
 
+    /// Some result of the hint at `call`, or an element of one, is returned.
+    fn hint_escapes(&self, hint: &HintCall) -> bool {
+        match self.returned.exact() {
+            Some(set) => set.iter().any(|l| l.hint_call() == Some(hint.instr)),
+            None => (0..hint.results.len()).any(|pos| {
+                self.g.leaf_may_reach_return(Leaf::Hint {
+                    call: hint.instr,
+                    pos,
+                    elem: None,
+                })
+            }),
+        }
+    }
+
     /// The forward slice of the hint at `call`, computed on demand.
     fn slice(&self, call: usize) -> HintSlice {
         self.g.slice(self.hint(call))
@@ -261,7 +275,9 @@ pub fn check_function(g: &Graph) -> Vec<Finding> {
         inverse_only_is_zero(&mut ctx, hint, &slice);
         unchecked_index(&mut ctx, hint, &slice);
         half_checked_sort(&mut ctx, hint, &slice);
+        indices_not_distinct(&mut ctx, hint, &slice);
         one_directional_bound(&mut ctx, hint, &slice);
+        partial_selection(&mut ctx, hint, &slice);
     }
     for c in &g.constraints {
         if c.kind == ConstraintKind::Equal {
@@ -330,6 +346,8 @@ fn constant_only(ctx: &mut Ctx, hint: &HintCall, slice: &HintSlice) {
     if linked {
         return;
     }
+    // A library function may return the result for its caller to tie down.
+    let escapes = ctx.hint_escapes(hint);
     let related = ctx.related(touching[0].instr, "only checked against a constant here");
     ctx.push(
         "NUC-001",
@@ -339,7 +357,7 @@ fn constant_only(ctx: &mut Ctx, hint: &HintCall, slice: &HintSlice) {
             hint.callee
         ),
         related,
-        false,
+        escapes,
     );
 }
 
@@ -541,6 +559,7 @@ fn unchecked_decomposition(ctx: &mut Ctx, idx: usize) {
             }
         }
         if unchecked.is_empty() {
+            modulus_aliasing(ctx, idx, call, &limbs);
             continue;
         }
         let hint = ctx.hint(call);
@@ -559,6 +578,52 @@ fn unchecked_decomposition(ctx: &mut Ctx, idx: usize) {
             escapes,
         );
     }
+}
+
+/// NUC-003, second form: every limb fits its slot, but the top limb's range
+/// reaches the field modulus, so `x` and `x + p` both decompose. The stdlib's
+/// `decompose` closes this by comparing the limbs to the modulus; any further
+/// constraint on the top limb is taken as such a comparison.
+fn modulus_aliasing(ctx: &mut Ctx, idx: usize, call: usize, limbs: &[(Val, BigInt, Leaf)]) {
+    let g = ctx.g;
+    let Some((top, weight, leaf)) = limbs.last() else {
+        return;
+    };
+    let (Some(bound), Some(weight_bits)) =
+        (limb_bound(g, *top), ratio_bits(&BigInt::from(1), weight))
+    else {
+        return;
+    };
+    let reach = weight_bits + bound;
+    if reach < FIELD_BITS {
+        return;
+    }
+    let slice = ctx.slice(call);
+    let top_value = g.strip_casts(*top);
+    let compared = slice.truncated
+        || touching(g, &slice).any(|c| {
+            let own_range = matches!(
+                &g.instrs[c.instr].kind,
+                Kind::RangeCheck { value: Operand::Val(v), .. } if g.strip_casts(*v) == top_value
+            );
+            c.instr != idx && !own_range && c.leaves.may_include(&Leaves::single(*leaf))
+        });
+    if compared {
+        return;
+    }
+    let hint = ctx.hint(call);
+    let escapes = ctx.escapes([*leaf]);
+    let related = ctx.related(idx, "recombined here");
+    ctx.push(
+        "NUC-003",
+        hint,
+        format!(
+            "the limbs from `{}` can represent values up to 2^{reach}, past the field modulus, so the input has more than one decomposition; compare the limbs to the modulus as `std::field::bn254::decompose` does",
+            hint.callee
+        ),
+        related,
+        escapes,
+    );
 }
 
 /// Bits a limb is proven to fit in: its type, a range check, or a boolean check.
@@ -702,7 +767,13 @@ enum Bound {
 /// asserts a comparison with the hint on one side only and the hint side
 /// grows with the hint's values (all its hint terms have positive weight).
 fn comparison_bound(g: &Graph, c: usize, call: usize) -> Option<Bound> {
-    let Kind::Constrain { lhs, rhs, .. } = &g.instrs[c].kind else {
+    comparison_with(g, c, call).map(|(bound, _)| bound)
+}
+
+/// [`comparison_bound`], with the operand the hint is compared to.
+fn comparison_with<'a>(g: &Graph<'a>, c: usize, call: usize) -> Option<(Bound, &'a Operand)> {
+    let instr: &'a Instr = g.instrs[c];
+    let Kind::Constrain { lhs, rhs, .. } = &instr.kind else {
         return None;
     };
     let (value, expected) = match (lhs, rhs) {
@@ -736,10 +807,148 @@ fn comparison_bound(g: &Graph, c: usize, call: usize) -> Option<Bound> {
     };
     // `a < b` holds when `holds`, otherwise `a >= b`.
     match (hint_on_a, hint_on_b) {
-        (true, false) if increasing(a) => Some(if holds { Bound::Upper } else { Bound::Lower }),
-        (false, true) if increasing(b) => Some(if holds { Bound::Lower } else { Bound::Upper }),
+        (true, false) if increasing(a) => {
+            Some((if holds { Bound::Upper } else { Bound::Lower }, b))
+        }
+        (false, true) if increasing(b) => {
+            Some((if holds { Bound::Lower } else { Bound::Upper }, a))
+        }
         _ => None,
     }
+}
+
+/// The values constraint `c` says the hint's result equals one of:
+/// `(m == a) | (m == b)` asserted true, or `(m - a) * (m - b) == 0`.
+fn selection<'a>(g: &Graph<'a>, c: usize, call: usize) -> Option<Vec<&'a Operand>> {
+    let instr: &'a Instr = g.instrs[c];
+    let Kind::Constrain { lhs, rhs, .. } = &instr.kind else {
+        return None;
+    };
+    let (Operand::Val(v), Some(expected)) = (lhs, rhs.constant()) else {
+        return None;
+    };
+    let is_result = |op: &Operand| {
+        g.hint_value(op)
+            .is_some_and(|leaf| leaf.hint_call() == Some(call))
+    };
+    let mut options = Vec::new();
+    if expected.is_zero() {
+        // (m - a) * (m - b) == 0
+        let Some(Kind::Binary {
+            op: BinOp::Mul,
+            lhs: f1,
+            rhs: f2,
+            ..
+        }) = g.def(g.strip_casts(*v)).map(|i| &i.kind)
+        else {
+            return None;
+        };
+        for factor in [f1, f2] {
+            let Some(Kind::Binary {
+                op: BinOp::Sub,
+                lhs: p,
+                rhs: q,
+                ..
+            }) = factor
+                .val()
+                .and_then(|f| g.def(g.strip_casts(f)))
+                .map(|i| &i.kind)
+            else {
+                return None;
+            };
+            match (is_result(p), is_result(q)) {
+                (true, false) => options.push(q),
+                (false, true) => options.push(p),
+                _ => return None,
+            }
+        }
+    } else {
+        // (m == a) | (m == b) | ...
+        let mut stack = vec![*v];
+        while let Some(v) = stack.pop() {
+            match g.def(v).map(|i| &i.kind) {
+                Some(Kind::Binary {
+                    op: BinOp::Or,
+                    lhs: Operand::Val(a),
+                    rhs: Operand::Val(b),
+                    ..
+                }) => stack.extend([*a, *b]),
+                Some(Kind::Binary {
+                    op: BinOp::Eq,
+                    lhs: p,
+                    rhs: q,
+                    ..
+                }) => match (is_result(p), is_result(q)) {
+                    (true, false) => options.push(q),
+                    (false, true) => options.push(p),
+                    _ => return None,
+                },
+                _ => return None,
+            }
+        }
+    }
+    (options.len() >= 2).then_some(options)
+}
+
+/// NUC-009, selection form: the result is pinned to one of several inputs and
+/// compared in one direction with some of them but not all, so it can be an
+/// input that is not the maximum (or minimum).
+fn partial_selection(ctx: &mut Ctx, hint: &HintCall, slice: &HintSlice) {
+    let g = ctx.g;
+    if slice.truncated || hint.results.len() != 1 {
+        return;
+    }
+    let linking: Vec<_> = touching(g, slice)
+        .filter(|c| c.leaves.may_reach_beyond(hint.instr))
+        .collect();
+    let Some((select_at, options)) = linking
+        .iter()
+        .find_map(|c| selection(g, c.instr, hint.instr).map(|o| (c.instr, o)))
+    else {
+        return;
+    };
+    let mut directions = BTreeSet::new();
+    let mut compared = Vec::new();
+    for c in &linking {
+        if c.instr == select_at {
+            continue;
+        }
+        let Some((bound, other)) = comparison_with(g, c.instr, hint.instr) else {
+            return;
+        };
+        directions.insert(bound == Bound::Upper);
+        compared.push(g.leaves_of(other));
+    }
+    if directions.len() != 1 {
+        return;
+    }
+    let missing = options
+        .iter()
+        .filter(|option| {
+            let leaves = g.leaves_of(option);
+            !compared
+                .iter()
+                .any(|c| c.exact().is_some() && c.exact() == leaves.exact())
+        })
+        .count();
+    if missing == 0 || compared.is_empty() {
+        return;
+    }
+    let upper = directions.contains(&true);
+    let related = ctx.related(select_at, "pinned to one of the inputs here");
+    ctx.push(
+        "NUC-009",
+        hint,
+        format!(
+            "the result of `{}` equals one of {} values but is compared with only {} of them, so it can be one that is not the {}",
+            hint.callee,
+            options.len(),
+            options.len() - missing,
+            if upper { "minimum" } else { "maximum" },
+        ),
+        related,
+        false,
+    );
 }
 
 /// NUC-009: every constraint tying the hint to its inputs is a comparison in the same direction.
@@ -875,22 +1084,40 @@ fn half_checked_sort(ctx: &mut Ctx, hint: &HintCall, slice: &HintSlice) {
         let output_leaf = |l: &Leaf| matches!(l, Leaf::Hint { call, pos: p, .. } if *call == hint.instr && *p == pos);
         let mut permutation_maybe = false;
         let mut permutation_surely = false;
+        let mut evidence = Vec::new();
+        let mut opaque = false;
         for c in touching(g, slice) {
             match c.leaves.exact() {
                 Some(leaves) => {
                     if leaves.iter().any(output_leaf) && c.leaves.may_intersect(input) {
                         permutation_maybe = true;
                         permutation_surely |= !input.is_many();
+                        evidence.push(c.instr);
                     }
                 }
-                None => permutation_maybe = true,
+                None => {
+                    permutation_maybe = true;
+                    opaque = true;
+                }
             }
         }
         // An index map (outputs used to index arrays) is not itself a sorted array.
         let used_as_index = slice.instrs.iter().any(
             |i| matches!(&g.instrs[*i].kind, Kind::ArrayGet { index, .. } if of_output(index)),
         );
+        // Sums of powers pin down n elements only when the sums of powers 1 to n
+        // all match (Newton's identities); fewer leave other multisets possible.
+        let weak_power_sums = (order_check.is_some() && permutation_surely && !opaque)
+            .then(|| power_sums_only(g, hint.instr, pos, typ, &evidence))
+            .flatten();
         let message = match (order_check, permutation_maybe, permutation_surely) {
+            (Some(_), _, _) if weak_power_sums.is_some() => {
+                let (powers, n) = weak_power_sums.expect("checked");
+                format!(
+                    "the array from `{}` is matched to the input only by its sums of powers {powers}; a permutation of {n} elements needs the sums of powers 1 to {n}",
+                    hint.callee
+                )
+            }
             (Some(_), false, _) => format!(
                 "the array from `{}` is checked to be ordered but never shown to be a permutation of the input",
                 hint.callee
@@ -910,6 +1137,201 @@ fn half_checked_sort(ctx: &mut Ctx, hint: &HintCall, slice: &HintSlice) {
             None => Vec::new(),
         };
         ctx.push("NUC-006", hint, message, related, false);
+    }
+}
+
+/// The exponents, when every constraint relating result `pos` of hint `call` to
+/// its input is a power sum `c·Σ s[i]^k` plus terms free of the result, and
+/// they are not all of 1 to n; `None` otherwise.
+fn power_sums_only(
+    g: &Graph,
+    call: usize,
+    pos: usize,
+    typ: &str,
+    evidence: &[usize],
+) -> Option<(String, u64)> {
+    let n = array_len(typ)?;
+    if n < 2 || evidence.is_empty() {
+        return None;
+    }
+    let mut powers = BTreeSet::new();
+    for idx in evidence {
+        powers.insert(power_sum_exponent(g, call, pos, n, &g.equation(*idx)?)?);
+    }
+    if (1..=n).all(|k| powers.contains(&(k as u32))) {
+        return None;
+    }
+    let list: Vec<String> = powers.iter().map(u32::to_string).collect();
+    Some((list.join(" and "), n))
+}
+
+/// `k` when the equation's terms on the result are `c·s[i]^k` for each of
+/// its `n` elements, with one `c` and one `k`.
+fn power_sum_exponent(g: &Graph, call: usize, pos: usize, n: u64, eq: &Linear) -> Option<u32> {
+    let mut seen: std::collections::BTreeMap<u64, (u32, &BigInt)> = Default::default();
+    let touches = |v: Val| g.leaves_of_val(v).may_touch_call(call);
+    for (atom, coeff) in &eq.terms {
+        let power = match atom {
+            Atom::Value(v) => output_power(g, call, pos, *v, 0),
+            Atom::Product(a, b) => {
+                match (
+                    output_power(g, call, pos, *a, 0),
+                    output_power(g, call, pos, *b, 0),
+                ) {
+                    (Some((ea, ka)), Some((eb, kb))) if ea == eb => Some((ea, ka + kb)),
+                    (None, None) => None,
+                    _ => return None,
+                }
+            }
+        };
+        match (power, atom) {
+            (Some((elem, k)), _) => {
+                if seen.insert(elem, (k, coeff)).is_some() {
+                    return None;
+                }
+            }
+            // Terms free of the result (the input side) can be anything.
+            (None, Atom::Value(v)) if !touches(*v) => {}
+            (None, Atom::Product(a, b)) if !touches(*a) && !touches(*b) => {}
+            (None, _) => return None,
+        }
+    }
+    let mut terms = seen.values();
+    let (k, c) = terms.next()?;
+    (seen.len() as u64 == n && terms.all(|(k2, c2)| k2 == k && c2 == c)).then_some(*k)
+}
+
+/// `(i, k)` when `v` is `s[i]^k` for element `i` of result `pos` of hint `call`.
+fn output_power(g: &Graph, call: usize, pos: usize, v: Val, depth: u32) -> Option<(u64, u32)> {
+    if depth > 8 {
+        return None;
+    }
+    let v = g.strip_casts(v);
+    if let Some(Leaf::Hint {
+        call: c,
+        pos: p,
+        elem: Some(elem),
+    }) = g.hint_value(&Operand::Val(v))
+    {
+        return (c == call && p == pos).then_some((elem, 1));
+    }
+    match &g.def(v)?.kind {
+        Kind::Binary {
+            op: BinOp::Mul,
+            lhs: Operand::Val(a),
+            rhs: Operand::Val(b),
+            ..
+        } => {
+            let (ea, ka) = output_power(g, call, pos, *a, depth + 1)?;
+            let (eb, kb) = output_power(g, call, pos, *b, depth + 1)?;
+            (ea == eb).then_some((ea, ka + kb))
+        }
+        _ => None,
+    }
+}
+
+/// NUC-006, index form: a hinted array of indices reads every position of an
+/// array of its own length (a permutation given as indices), but nothing shows
+/// the indices are distinct, so one element can be read twice and another
+/// skipped. Distinctness shows as a constraint on two of the indices
+/// (`idx[i] != idx[j]`) or as a read of the index array at a hinted position
+/// (the inverse-map check of `std`'s `check_shuffle`).
+fn indices_not_distinct(ctx: &mut Ctx, hint: &HintCall, slice: &HintSlice) {
+    let g = ctx.g;
+    if slice.truncated {
+        return;
+    }
+    for (pos, typ) in hint.result_types.iter().enumerate() {
+        let Some(n) = array_len(typ).filter(|n| *n >= 2) else {
+            continue;
+        };
+        if !typ.starts_with("[u") {
+            continue;
+        }
+        let Some(result) = hint.results.get(pos) else {
+            continue;
+        };
+        let elem_of = |op: &Operand| match g.hint_value(op) {
+            Some(Leaf::Hint {
+                call,
+                pos: p,
+                elem: Some(e),
+            }) if call == hint.instr && p == pos => Some(e),
+            _ => None,
+        };
+        let mut reads: std::collections::BTreeMap<Val, BTreeSet<u64>> = Default::default();
+        let mut inverse_read = false;
+        for i in &slice.instrs {
+            let Kind::ArrayGet { array, index } = &g.instrs[*i].kind else {
+                continue;
+            };
+            if array.val() == Some(*result) && index.constant().is_none() {
+                inverse_read = true;
+            }
+            if let (Some(e), Some(target)) = (elem_of(index), array.val()) {
+                reads.entry(target).or_default().insert(e);
+            }
+        }
+        let permutes = reads.iter().any(|(target, elems)| {
+            elems.len() as u64 == n
+                && g.type_of(*target).and_then(array_len) == Some(n)
+                && !g.leaves_of_val(*target).may_touch_call(hint.instr)
+        });
+        if !permutes || inverse_read {
+            continue;
+        }
+        let relates_two = touching(g, slice).any(|c| {
+            let mut elems = BTreeSet::new();
+            for op in g.instrs[c.instr].kind.operands() {
+                index_elems(g, op, &elem_of, &mut elems, 0);
+            }
+            elems.len() >= 2
+        });
+        if relates_two {
+            continue;
+        }
+        ctx.push(
+            "NUC-006",
+            hint,
+            format!(
+                "the indices from `{}` read all {n} positions of an array but are never shown to be distinct, so one element can be read twice and another skipped",
+                hint.callee
+            ),
+            Vec::new(),
+            false,
+        );
+    }
+}
+
+/// The index elements `op` is computed from directly, through arithmetic and
+/// comparisons but not through array reads.
+fn index_elems(
+    g: &Graph,
+    op: &Operand,
+    elem_of: &dyn Fn(&Operand) -> Option<u64>,
+    out: &mut BTreeSet<u64>,
+    depth: u32,
+) {
+    if let Some(e) = elem_of(op) {
+        out.insert(e);
+        return;
+    }
+    let Some(v) = op.val() else {
+        return;
+    };
+    if depth > 4 {
+        return;
+    }
+    let Some(instr) = g.def(v) else {
+        return;
+    };
+    if matches!(
+        instr.kind,
+        Kind::Binary { .. } | Kind::Not(_) | Kind::Cast { .. }
+    ) {
+        for inner in instr.kind.operands() {
+            index_elems(g, inner, elem_of, out, depth + 1);
+        }
     }
 }
 

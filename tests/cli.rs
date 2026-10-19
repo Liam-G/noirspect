@@ -251,7 +251,7 @@ fn parallel_jobs_match_a_sequential_run() {
             .collect::<Vec<_>>()
     };
     let sequential = ids("1");
-    assert_eq!(sequential.len(), 5);
+    assert_eq!(sequential.len(), 6);
     assert_eq!(ids("3"), sequential);
 }
 
@@ -285,5 +285,24 @@ fn copy_dir(from: &Path, to: &Path) {
         } else {
             std::fs::copy(entry.path(), target).unwrap();
         }
+    }
+}
+
+#[test]
+fn version_names_the_pinned_nargo_release() {
+    let out = noirspect(&["--version"]);
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains(&format!("(nargo {})", noirspect::report::NOIR_VERSION)));
+    // Every compiler crate in Cargo.toml must be pinned to that same release.
+    let manifest =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml")).unwrap();
+    let tag = format!("tag = \"v{}\"", noirspect::report::NOIR_VERSION);
+    let pinned: Vec<&str> = manifest
+        .lines()
+        .filter(|l| l.contains("noir-lang/noir"))
+        .collect();
+    assert!(!pinned.is_empty());
+    for line in pinned {
+        assert!(line.contains(&tag), "{line} is not pinned to {tag}");
     }
 }

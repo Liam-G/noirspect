@@ -122,7 +122,15 @@ pub fn json_report(analysis: &Analysis) -> Value {
     })
 }
 
-pub const NOIR_VERSION: &str = "1.0.0-beta.26";
+/// The nargo release whose compiler crates this build contains.
+#[macro_export]
+macro_rules! noir_version {
+    () => {
+        "1.0.0-rc.5"
+    };
+}
+
+pub const NOIR_VERSION: &str = noir_version!();
 
 fn sarif_level(severity: Severity) -> &'static str {
     match severity {

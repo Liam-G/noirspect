@@ -41,6 +41,26 @@ fn is_trivial(reason: &str) -> bool {
     TRIVIAL_REASONS.contains(&cleaned.trim().to_ascii_lowercase().as_str())
 }
 
+/// Line `i` is inside a `#[test]` function, which is never part of a circuit.
+fn in_test(lines: &[&str], i: usize) -> bool {
+    let is_fn = |line: &str| {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        words
+            .iter()
+            .take_while(|w| w.starts_with("pub") || ["unconstrained", "comptime", "fn"].contains(w))
+            .any(|w| *w == "fn")
+    };
+    let Some(header) = (0..=i).rev().find(|&j| is_fn(lines[j])) else {
+        return false;
+    };
+    lines[..header]
+        .iter()
+        .rev()
+        .map(|l| l.trim())
+        .take_while(|l| l.starts_with("#[") || l.starts_with("//"))
+        .any(|l| l.starts_with("#[test"))
+}
+
 /// NUC-008 over one file's text. `file` is the name used in reports.
 pub fn empty_safety_comments(file: &str, text: &str) -> Vec<Finding> {
     let lines: Vec<&str> = text.lines().collect();
@@ -54,7 +74,7 @@ pub fn empty_safety_comments(file: &str, text: &str) -> Vec<Finding> {
             .iter()
             .take_while(|l| l.trim_start().starts_with("//"))
             .any(|l| !l.trim_start().trim_start_matches('/').trim().is_empty());
-        if !is_trivial(&reason) || (reason.is_empty() && continuation) {
+        if !is_trivial(&reason) || (reason.is_empty() && continuation) || in_test(&lines, i) {
             continue;
         }
         let col = line.find("//").map_or(1, |c| c as u32 + 1);
@@ -127,6 +147,17 @@ mod tests {
             .map(|f| f.loc.as_ref().unwrap().line)
             .collect();
         assert_eq!(lines, vec![2, 4, 6]);
+    }
+
+    #[test]
+    fn test_functions_are_skipped() {
+        let text = "#[test]\nfn t() {\n    // Safety:\n    unsafe { h() };\n}\n\nfn f() {\n    // Safety:\n    unsafe { h() };\n}\n";
+        let findings = empty_safety_comments("a.nr", text);
+        let lines: Vec<u32> = findings
+            .iter()
+            .map(|f| f.loc.as_ref().unwrap().line)
+            .collect();
+        assert_eq!(lines, vec![8]);
     }
 
     #[test]

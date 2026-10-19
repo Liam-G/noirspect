@@ -55,3 +55,13 @@ pub fn safe_5(x: Field) -> u8 {
     let bytes: [u8; 32] = x.to_le_bytes();
     bytes[0]
 }
+
+// The look-alikes accept honest witnesses (run with `nargo test`).
+#[test]
+fn honest_inputs_pass() {
+    let _ = safe_1(200);
+    let _ = safe_2(300);
+    let _ = safe_3(7);
+    let _ = safe_4(60000);
+    let _ = safe_5(5);
+}

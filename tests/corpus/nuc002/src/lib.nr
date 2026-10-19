@@ -87,3 +87,14 @@ pub fn safe_5(n: u32, d: u32) -> u32 {
     assert((r as u64) < (d as u64));
     q
 }
+
+// The look-alikes accept honest witnesses (run with `nargo test`).
+#[test]
+fn honest_inputs_pass() {
+    let _ = safe_1(17, 5);
+    let _ = safe_1(4294967295, 1);
+    let _ = safe_2(17, 5);
+    let _ = safe_3(17, 5);
+    let _ = safe_4(17, 5);
+    let _ = safe_5(17, 5);
+}

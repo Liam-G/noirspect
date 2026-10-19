@@ -24,6 +24,10 @@ unconstrained fn secret_hint() -> u32 {
     42
 }
 
+unconstrained fn third_hint(x: u64) -> u64 {
+    x / 3
+}
+
 unconstrained fn max_hint(a: u32, b: u32) -> u32 {
     if a > b { a } else { b }
 }
@@ -97,4 +101,26 @@ pub fn safe_5(a: u32, b: u32) -> u32 {
     assert(m >= a);
     assert(m >= b);
     m
+}
+
+pub fn safe_6(x: u64) -> u64 {
+    // Safety: q is only range checked here; it is returned, and the caller
+    // checks 3 * q <= x < 3 * q + 3
+    let q = unsafe { third_hint(x) };
+    assert(q < 4294967296);
+    q
+}
+
+// The look-alikes accept honest witnesses (run with `nargo test`).
+#[test]
+fn honest_inputs_pass() {
+    safe_1(10);
+    safe_1(0);
+    let _ = safe_2();
+    safe_3(5);
+    safe_4(3);
+    safe_4(4);
+    let _ = safe_5(3, 7);
+    let _ = safe_5(7, 3);
+    let _ = safe_6(10);
 }

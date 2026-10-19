@@ -14,7 +14,7 @@ use std::time::Duration;
 #[derive(Parser)]
 #[command(
     name = "noirspect",
-    version,
+    version = concat!(env!("CARGO_PKG_VERSION"), " (nargo ", noirspect::noir_version!(), ")"),
     about = "Find under-constrained values in Noir circuits."
 )]
 struct Cli {

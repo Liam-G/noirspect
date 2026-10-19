@@ -28,6 +28,15 @@ unconstrained fn split_hint(x: Field) -> (Field, Field) {
     (lo, (x - lo) / 340282366920938463463374607431768211456)
 }
 
+global TWO_POW_128: Field = 340282366920938463463374607431768211456;
+// The BN254 scalar field modulus, as 128-bit limbs.
+global PLO: Field = 53438638232309528389504892708671455233;
+global PHI: Field = 64323764613183177041862057485226039389;
+
+unconstrained fn lte_hint(a: Field, b: Field) -> bool {
+    (a as u128) <= (b as u128)
+}
+
 unconstrained fn limbs64_hint(x: Field) -> [u64; 2] {
     let v = x as u64;
     [v & 0xffffffff, v >> 32]
@@ -78,6 +87,15 @@ pub fn vuln_5(x: Field) {
     assert(bits[0] + bits[1] * 2 + bits[2] * 4 + bits[3] * 8 == x);
 }
 
+// expect: NUC-003
+pub fn vuln_6(x: Field) {
+    // Safety: both halves are range checked to 128 bits and recombined
+    let (lo, hi) = unsafe { split_hint(x) };
+    lo.assert_max_bit_size::<128>();
+    hi.assert_max_bit_size::<128>();
+    assert(lo + hi * 340282366920938463463374607431768211456 == x);
+}
+
 pub fn safe_1(x: Field) {
     // Safety: every bit is checked to be 0 or 1 and recombined
     let bits = unsafe { bits_hint(x) };
@@ -125,9 +143,36 @@ pub fn safe_4(x: Field) {
 }
 
 pub fn safe_5(x: Field) {
-    // Safety: both halves are range checked to 128 bits and recombined
+    // Safety: a 248-bit value split into 128 and 120 bits, which stays below the modulus
+    let (lo, hi) = unsafe { split_hint(x) };
+    lo.assert_max_bit_size::<128>();
+    hi.assert_max_bit_size::<120>();
+    assert(lo + hi * 340282366920938463463374607431768211456 == x);
+}
+
+pub fn safe_6(x: Field) {
+    // Safety: both halves are range checked, recombined, and compared to the
+    // modulus limbs, like std::field::bn254::decompose
     let (lo, hi) = unsafe { split_hint(x) };
     lo.assert_max_bit_size::<128>();
     hi.assert_max_bit_size::<128>();
-    assert(lo + hi * 340282366920938463463374607431768211456 == x);
+    assert(lo + hi * TWO_POW_128 == x);
+    // Safety: the borrow is boolean by type; the range checks below fail unless (hi, lo) < p
+    let borrow = unsafe { lte_hint(PLO, lo) };
+    let rlo = PLO - lo - 1 + (borrow as Field) * TWO_POW_128;
+    let rhi = PHI - hi - (borrow as Field);
+    rlo.assert_max_bit_size::<128>();
+    rhi.assert_max_bit_size::<128>();
+}
+
+// The look-alikes accept honest witnesses (run with `nargo test`).
+#[test]
+fn honest_inputs_pass() {
+    safe_1(11);
+    safe_2(0x12345678);
+    safe_3(200);
+    safe_4(0x01020304);
+    safe_5(5);
+    safe_6(5);
+    safe_6(-1);
 }

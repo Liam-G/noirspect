@@ -2,6 +2,49 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.3.0 - 2026-10-20
+
+- Support nargo 1.0.0-rc.5 (was 1.0.0-beta.26). `noirspect --version` names
+  the supported release, and a test keeps it in step with the pinned compiler
+  crates.
+- NUC-003 now also reports limbs that each fit their width but together reach
+  past the field modulus, such as two 128-bit halves of a `Field`: `x` and
+  `x + p` then both decompose. A comparison with the modulus, as in
+  `std::field::bn254::decompose`, satisfies the rule.
+- NUC-006 now also reports permutation checks that are too weak: hinted
+  indices that may repeat (`s[i] == a[idx[i]]` with nothing showing the
+  indices are distinct), and power sums that cannot pin the multiset (the sum
+  and the sum of squares for four elements).
+- NUC-009 now also reports a result pinned to one of several inputs but
+  compared with only some of them: `(m == a) | (m == b)` with `m >= b` alone
+  lets the maximum of 7 and 3 be 3.
+- In library mode, NUC-001 no longer reports a hint result that is returned
+  for the caller to check, like the other rules.
+- Analyze generic functions that take `&mut` parameters through their
+  instances. The compiler's in-place array write pass asserts that no memory
+  is left, which fails when such an instance stands in for `main`; noirspect
+  skips that pass for instances. Values that still pass through memory are
+  not followed, which can hide a finding but never adds one. The standard
+  library goes from 28 skipped entry points to 10.
+- Count a constant upper bound as a range check: an asserted `x < C`, and a
+  read from a fixed-size array at index `x`, which ACIR bounds checks. Lookup
+  tables used as range checks (as in sha512) no longer raise NUC-003.
+- NUC-008 skips `#[test]` functions, which are never part of a circuit.
+- Give workers time to check and plan a large crate before their first entry:
+  three times what the parent took, plus 30 seconds, instead of one entry's
+  budget. Every entry of Aztec's private kernel library was skipped before.
+- Fix the seeded suite. An audit found four look-alikes that were themselves
+  under-constrained, and one that rejected honest inputs:
+  - two hinted index maps without a distinctness check, two power sums for
+    four elements, and two 128-bit halves past the modulus are now vulnerable
+    cases, with sound look-alikes next to them;
+  - a product check at a constant challenge now derives the challenge from a
+    hash of both arrays;
+  - a minimum check that underflowed when `b < a` now compares as `Field`.
+- Run the seeded suite with nargo in CI: every look-alike accepts honest
+  inputs, and `tests/exploits` shows a wrong witness accepted by each new
+  vulnerable case and rejected by its fix.
+
 ## 0.2.1 - 2026-10-19
 
 - Fix memory exhaustion on very large circuits. A package with benchmark

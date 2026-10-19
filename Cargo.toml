@@ -1,6 +1,6 @@
 [package]
 name = "noirspect"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.89"
 description = "Static analyzer for under-constrained values in Noir zero-knowledge circuits"
@@ -21,13 +21,13 @@ num-bigint = "0.5"
 num-traits = "0.2"
 
 # Noir compiler crates, pinned to the nargo release this version supports.
-nargo = { git = "https://github.com/noir-lang/noir", tag = "v1.0.0-beta.26" }
-nargo_toml = { git = "https://github.com/noir-lang/noir", tag = "v1.0.0-beta.26" }
-noirc_driver = { git = "https://github.com/noir-lang/noir", tag = "v1.0.0-beta.26" }
-noirc_evaluator = { git = "https://github.com/noir-lang/noir", tag = "v1.0.0-beta.26" }
-noirc_frontend = { git = "https://github.com/noir-lang/noir", tag = "v1.0.0-beta.26" }
-noirc_errors = { git = "https://github.com/noir-lang/noir", tag = "v1.0.0-beta.26" }
-fm = { git = "https://github.com/noir-lang/noir", tag = "v1.0.0-beta.26" }
+nargo = { git = "https://github.com/noir-lang/noir", tag = "v1.0.0-rc.5" }
+nargo_toml = { git = "https://github.com/noir-lang/noir", tag = "v1.0.0-rc.5" }
+noirc_driver = { git = "https://github.com/noir-lang/noir", tag = "v1.0.0-rc.5" }
+noirc_evaluator = { git = "https://github.com/noir-lang/noir", tag = "v1.0.0-rc.5" }
+noirc_frontend = { git = "https://github.com/noir-lang/noir", tag = "v1.0.0-rc.5" }
+noirc_errors = { git = "https://github.com/noir-lang/noir", tag = "v1.0.0-rc.5" }
+fm = { git = "https://github.com/noir-lang/noir", tag = "v1.0.0-rc.5" }
 
 [profile.release]
 lto = "thin"

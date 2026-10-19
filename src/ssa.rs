@@ -262,6 +262,8 @@ impl Function {
 #[derive(Debug, Clone, Default)]
 pub struct Program {
     pub functions: BTreeMap<String, Function>,
+    /// Types of the globals printed before the functions (`g4 = ... : [u128; 3]`).
+    pub global_types: BTreeMap<u32, String>,
 }
 
 impl Program {
@@ -290,6 +292,12 @@ pub fn is_field(typ: &str) -> bool {
 
 pub fn is_array(typ: &str) -> bool {
     typ.starts_with('[')
+}
+
+/// The length of a fixed-size array type such as `[u32; 4]` or `[(u32, u32); 4]`.
+pub fn array_len(typ: &str) -> Option<u64> {
+    let inner = typ.strip_prefix('[')?.strip_suffix(']')?;
+    inner.rsplit_once("; ")?.1.parse().ok()
 }
 
 fn is_numeric_type(word: &str) -> bool {
@@ -826,6 +834,17 @@ fn parse_function_header(line: &str) -> Option<(Runtime, String, String)> {
 }
 
 /// Parse a whole printed SSA program.
+/// `g4 = make_array [...] : [u128; 3]` or `g1 = u128 6719...`: the id and type.
+fn parse_global(line: &str) -> Option<(u32, String)> {
+    let (name, value) = line.trim().split_once(" = ")?;
+    let id = name.strip_prefix('g')?.parse().ok()?;
+    let typ = match value.strip_prefix("make_array ") {
+        Some(array) => array.rsplit_once(" : ")?.1.to_string(),
+        None => value.split_whitespace().next()?.to_string(),
+    };
+    Some((id, typ))
+}
+
 pub fn parse_program(text: &str) -> Program {
     let mut program = Program::default();
     let mut current: Option<Function> = None;
@@ -840,6 +859,9 @@ pub fn parse_program(text: &str) -> Program {
             continue;
         }
         let Some(function) = current.as_mut() else {
+            if let Some((id, typ)) = parse_global(line) {
+                program.global_types.insert(id, typ);
+            }
             continue;
         };
         if line.trim() == "}" {
@@ -893,6 +915,15 @@ brillig(inline) predicate_pure fn div_hint f3 {
     return v2, v3
 }
 ";
+
+    #[test]
+    fn array_lengths() {
+        assert_eq!(array_len("[u32; 4]"), Some(4));
+        assert_eq!(array_len("[(u32, u32); 16]"), Some(16));
+        assert_eq!(array_len("[[u8; 2]; 3]"), Some(3));
+        assert_eq!(array_len("[Field]"), None);
+        assert_eq!(array_len("u32"), None);
+    }
 
     #[test]
     fn parses_functions_and_instructions() {

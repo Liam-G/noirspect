@@ -105,3 +105,17 @@ pub fn safe_5(a: Field, b: Field) -> Field {
     assert((a - b) * flag == 0);
     flag
 }
+
+// The look-alikes accept honest witnesses (run with `nargo test`).
+#[test]
+fn honest_inputs_pass() {
+    let _ = safe_1(0);
+    let _ = safe_1(5);
+    let _ = safe_2(0);
+    let _ = safe_2(5);
+    let _ = safe_3(0);
+    let _ = safe_4(0);
+    let _ = safe_4(5);
+    let _ = safe_5(3, 3);
+    let _ = safe_5(3, 4);
+}

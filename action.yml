@@ -14,7 +14,7 @@ inputs:
     default: ""
   version:
     description: noirspect release tag to install.
-    default: v0.2.1
+    default: v0.3.0
   sarif-file:
     description: Where to write the SARIF report.
     default: noirspect.sarif

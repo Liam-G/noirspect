@@ -72,6 +72,24 @@ pub fn vuln_5(x: u64) -> u64 {
     q
 }
 
+// expect: NUC-009
+pub fn vuln_6(a: u32, b: u32) -> u32 {
+    // Safety: the maximum is one of the inputs and not below b
+    let m = unsafe { max_hint(a, b) };
+    assert((m == a) | (m == b));
+    assert(m >= b);
+    m
+}
+
+// expect: NUC-009
+pub fn vuln_7(a: u32, b: u32) -> u32 {
+    // Safety: the minimum equals one input and is not above a
+    let m = unsafe { min_hint(a, b) };
+    assert(m <= a);
+    assert(((m as Field) - (a as Field)) * ((m as Field) - (b as Field)) == 0);
+    m
+}
+
 pub fn safe_1(y: u64) -> u64 {
     // Safety: r * r <= y < (r + 1) * (r + 1) pins the root
     let r = unsafe { sqrt_hint(y) };
@@ -95,7 +113,7 @@ pub fn safe_3(a: u32, b: u32) -> u32 {
     let m = unsafe { min_hint(a, b) };
     assert(m <= a);
     assert(m <= b);
-    assert((m - a) * (m - b) == 0);
+    assert(((m as Field) - (a as Field)) * ((m as Field) - (b as Field)) == 0);
     m
 }
 
@@ -113,4 +131,19 @@ pub fn safe_5(x: u32) -> u32 {
     let rest = x - 2 * h;
     assert(rest < 2);
     h
+}
+
+// The look-alikes accept honest witnesses (run with `nargo test`).
+#[test]
+fn honest_inputs_pass() {
+    let _ = safe_1(10);
+    let _ = safe_1(16);
+    let _ = safe_2(3, 7);
+    let _ = safe_2(7, 3);
+    let _ = safe_3(3, 7);
+    let _ = safe_3(7, 3);
+    let _ = safe_4(9);
+    let _ = safe_4(8);
+    let _ = safe_5(9);
+    let _ = safe_5(8);
 }

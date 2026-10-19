@@ -21,7 +21,7 @@ use noirc_evaluator::ssa::{SsaBuilder, SsaEvaluatorOptions, SsaLogging, primary_
 use noirc_frontend::Type;
 use noirc_frontend::graph::CrateId;
 use noirc_frontend::hir::printer::{crate_to_module, items};
-use noirc_frontend::hir::{Context, ParsedFiles};
+use noirc_frontend::hir::{CheckedContext, Context, ParsedFiles};
 use noirc_frontend::monomorphization::monomorphize;
 use noirc_frontend::node_interner::FuncId;
 use noirc_frontend::token::FunctionAttributeKind;
@@ -30,6 +30,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -129,8 +130,8 @@ pub fn load(options: &LoadOptions) -> Result<WorkspaceSsa, String> {
 
 struct Loaded {
     workspace: Workspace,
-    file_manager: FileManager,
-    parsed_files: ParsedFiles,
+    file_manager: Arc<FileManager>,
+    parsed_files: Arc<ParsedFiles>,
 }
 
 fn load_workspace(program_dir: &Path, package: Option<&str>, all: bool) -> Result<Loaded, String> {
@@ -157,8 +158,8 @@ fn load_workspace(program_dir: &Path, package: Option<&str>, all: bool) -> Resul
     let parsed_files = parse_all(&file_manager);
     Ok(Loaded {
         workspace,
-        file_manager,
-        parsed_files,
+        file_manager: Arc::new(file_manager),
+        parsed_files: Arc::new(parsed_files),
     })
 }
 
@@ -166,14 +167,18 @@ fn load_on_current_thread(options: &LoadOptions) -> Result<WorkspaceSsa, String>
     let loaded = load_workspace(options.program_dir, options.package, options.workspace)?;
     let mut packages = Vec::new();
     for package in &loaded.workspace {
+        let planning = std::time::Instant::now();
         let mut prepared = PreparedPackage::new(&loaded, package)?;
         let plan = prepared.plan(options.entry, options.function_filter);
+        // A worker checks and plans the package again before its first entry,
+        // which on large crates takes longer than one entry's budget.
+        let startup = planning.elapsed() * 3 + Duration::from_secs(30);
         let entries = match &options.worker {
             None => plan
                 .iter()
                 .map(|entry| prepared.lower_entry(entry))
                 .collect(),
-            Some(worker) => lower_in_workers(worker, options, package, &plan),
+            Some(worker) => lower_in_workers(worker, options, package, &plan, startup),
         };
         packages.push(PackageSsa {
             name: package.name.to_string(),
@@ -200,20 +205,21 @@ pub struct PlannedEntry {
 struct PreparedPackage<'a> {
     loaded: &'a Loaded,
     package: &'a Package,
-    context: Context<'a, 'a>,
+    context: CheckedContext,
     crate_id: CrateId,
     ssa_options: SsaEvaluatorOptions,
 }
 
 impl<'a> PreparedPackage<'a> {
     fn new(loaded: &'a Loaded, package: &'a Package) -> Result<Self, String> {
-        let (mut context, crate_id) =
+        let (context, crate_id) =
             prepare_package(&loaded.file_manager, &loaded.parsed_files, package);
         let compile_options = CompileOptions {
             silence_warnings: true,
             ..CompileOptions::default()
         };
-        if let Err(errors) = check_crate(&mut context, crate_id, &compile_options) {
+        let (context, checked) = check_crate(context, crate_id, &compile_options);
+        if let Err(errors) = checked {
             let errors: Vec<_> = errors.iter().filter(|d| d.is_error()).collect();
             return Err(format!(
                 "package `{}` does not compile:\n{}",
@@ -280,7 +286,7 @@ impl<'a> PreparedPackage<'a> {
             let mut covered = BTreeSet::new();
             for source in sources {
                 for (instance, name) in
-                    generic_instances(&mut self.context, source, &functions.generic_names)
+                    generic_instances(&self.context, source, &functions.generic_names)
                 {
                     if !matches_filter(&name) || !covered.insert(name.clone()) {
                         continue;
@@ -297,12 +303,7 @@ impl<'a> PreparedPackage<'a> {
     }
 
     fn lower_entry(&mut self, entry: &PlannedEntry) -> EntrySsa {
-        let ssa = optimized_ssa(
-            &mut self.context,
-            entry.func,
-            entry.instance,
-            &self.ssa_options,
-        );
+        let ssa = optimized_ssa(&self.context, entry.func, entry.instance, &self.ssa_options);
         EntrySsa {
             name: entry.name.clone(),
             is_main: entry.is_main,
@@ -444,12 +445,14 @@ fn resident_bytes(pid: u32) -> Option<u64> {
 }
 
 impl Session {
-    fn start(
-        worker: &Worker,
-        options: &LoadOptions,
-        package: &Package,
-        plan: &[PlannedEntry],
-    ) -> Result<Session, String> {
+    fn start(pool: &Pool) -> Result<Session, String> {
+        let Pool {
+            worker,
+            options,
+            package,
+            plan,
+            startup,
+        } = *pool;
         let mut command = Command::new(&worker.exe);
         command
             .arg("__lower")
@@ -486,10 +489,9 @@ impl Session {
             lowered: 0,
             baseline: None,
         };
-        // Loading and checking the crate counts against the same time budget.
         let header = session
             .lines
-            .recv_timeout(worker.timeout)
+            .recv_timeout(startup.max(worker.timeout))
             .ok()
             .and_then(|line| serde_json::from_str::<WorkerPlan>(&line).ok());
         let expected: Vec<&str> = plan.iter().map(|e| e.name.as_str()).collect();
@@ -585,23 +587,22 @@ fn lower_in_workers(
     options: &LoadOptions,
     package: &Package,
     plan: &[PlannedEntry],
+    startup: Duration,
 ) -> Vec<EntrySsa> {
     let jobs = worker.jobs.clamp(1, plan.len().max(1));
     let share = meminfo_bytes("MemTotal:").map(|total| (total / 2 / jobs as u64).max(2 * GIB));
     let all: Vec<(usize, Duration)> = (0..plan.len()).map(|i| (i, worker.timeout)).collect();
-    let (mut results, deferred) = lower_pass(
+    let pool = Pool {
         worker,
         options,
         package,
         plan,
-        &all,
-        jobs,
-        share.filter(|_| jobs > 1),
-    );
+        startup,
+    };
+    let (mut results, deferred) = lower_pass(&pool, &all, jobs, share.filter(|_| jobs > 1));
     if !deferred.is_empty() {
         let alone = meminfo_bytes("MemAvailable:").map(|available| available / 4 * 3);
-        let (retried, still_too_big) =
-            lower_pass(worker, options, package, plan, &deferred, 1, alone);
+        let (retried, still_too_big) = lower_pass(&pool, &deferred, 1, alone);
         for (index, lowered) in retried.into_iter().enumerate() {
             if lowered.is_some() {
                 results[index] = lowered;
@@ -626,18 +627,27 @@ fn lower_in_workers(
 
 type Budgeted = (usize, Duration);
 
+/// What every worker of one package is started with.
+#[derive(Clone, Copy)]
+struct Pool<'a> {
+    worker: &'a Worker,
+    options: &'a LoadOptions<'a>,
+    package: &'a Package,
+    plan: &'a [PlannedEntry],
+    /// How long a worker may take to check and plan the package.
+    startup: Duration,
+}
+
 /// Lower `entries` (plan index, time left) with `jobs` workers; returns the
 /// results (indexed like `plan`) and the entries that outgrew `memory_cap`,
 /// with the time they have left.
 fn lower_pass(
-    worker: &Worker,
-    options: &LoadOptions,
-    package: &Package,
-    plan: &[PlannedEntry],
+    pool: &Pool,
     entries: &[Budgeted],
     jobs: usize,
     memory_cap: Option<u64>,
 ) -> (Vec<Option<Result<String, String>>>, Vec<Budgeted>) {
+    let (worker, plan) = (pool.worker, pool.plan);
     let timed_out = || {
         format!(
             "lowering took longer than {}s; skipped",
@@ -658,7 +668,7 @@ fn lower_pass(
                         continue;
                     }
                     if session.is_none() {
-                        match Session::start(worker, options, package, plan) {
+                        match Session::start(pool) {
                             Ok(started) => session = Some(started),
                             Err(error) => {
                                 *fatal.lock().expect("fatal lock") = Some(error.clone());
@@ -857,19 +867,12 @@ fn collect_item(item: &items::Item, out: &mut Vec<FuncId>) {
 
 /// Constrained instantiations of the crate's generic functions in `source`'s SSA.
 fn generic_instances(
-    context: &mut Context,
+    context: &Context,
     source: FuncId,
     generic_names: &BTreeSet<String>,
 ) -> Vec<(FunctionId, String)> {
-    let file_manager = context.file_manager.clone();
     let outcome = catch_unwind(AssertUnwindSafe(|| {
-        let program = monomorphize(
-            source,
-            &mut context.def_interner,
-            file_manager.as_file_map(),
-            false,
-        )
-        .ok()?;
+        let program = monomorphize(source, &context.def_interner, false).ok()?;
         let ssa = generate_ssa(program).ok()?;
         Some(
             ssa.functions
@@ -890,28 +893,30 @@ fn generic_instances(
 /// inside `func`'s program becomes the entry point instead of `func` itself, so
 /// a generic function is analyzed with its own parameters as circuit inputs.
 fn optimized_ssa(
-    context: &mut Context,
+    context: &Context,
     func: FuncId,
     instance: Option<FunctionId>,
     ssa_options: &SsaEvaluatorOptions,
 ) -> Result<String, String> {
     let file_manager = context.file_manager.clone();
     let outcome = catch_unwind(AssertUnwindSafe(|| -> Result<String, String> {
-        let program = monomorphize(
-            func,
-            &mut context.def_interner,
-            file_manager.as_file_map(),
-            false,
-        )
-        .map_err(|e| CustomDiagnostic::from(e).message)?;
+        let program = monomorphize(func, &context.def_interner, false)
+            .map_err(|e| CustomDiagnostic::from(e).message)?;
         let mut ssa = generate_ssa(program).map_err(|e| CustomDiagnostic::from(e).message)?;
         if let Some(instance) = instance {
             ssa.main_id = instance;
         }
         let builder =
             SsaBuilder::from_ssa(ssa, SsaLogging::None, false, false, Some(&file_manager));
+        // With a generic instance standing in for `main`, `&mut` parameters stay
+        // memory, which this pass asserts is gone. It only marks array writes
+        // that may happen in place, which the rules do not look at.
+        let passes: Vec<_> = primary_passes(ssa_options)
+            .into_iter()
+            .filter(|pass| instance.is_none() || pass.msg() != "Mutable Array Set Optimizations")
+            .collect();
         let builder = builder
-            .run_passes(&primary_passes(ssa_options))
+            .run_passes(&passes)
             .map_err(|e| CustomDiagnostic::from(e).message)?;
         Ok(builder.ssa().print_with(Some(&file_manager)).to_string())
     }));

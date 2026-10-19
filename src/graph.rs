@@ -11,7 +11,7 @@
 //! "many", and every query on a summarized set answers the way that keeps a
 //! rule quiet. Likewise each hint's [`HintSlice`] is a bounded forward walk.
 
-use crate::ssa::{BinOp, Function, Instr, Kind, Operand, Program, Val, int_bits};
+use crate::ssa::{BinOp, Function, Instr, Kind, Operand, Program, Val, array_len, int_bits};
 use num_bigint::BigInt;
 use num_traits::{One, Signed, Zero};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -61,7 +61,7 @@ impl Leaves {
         }
     }
 
-    fn many() -> Leaves {
+    pub fn many() -> Leaves {
         Leaves {
             set: Rc::default(),
             many: true,
@@ -266,6 +266,15 @@ impl<'a> Graph<'a> {
             returned_values: Default::default(),
             is_hint_call: HashSet::new(),
         };
+        for (id, typ) in &program.global_types {
+            graph.types.insert(
+                Val {
+                    global: true,
+                    id: *id,
+                },
+                typ.clone(),
+            );
+        }
         for block in &func.blocks {
             for (val, typ) in &block.params {
                 graph.types.insert(*val, typ.clone());
@@ -352,6 +361,10 @@ impl<'a> Graph<'a> {
                 self.union_of(&[lhs, rhs])
             }
             Kind::Call { args, .. } => self.union_of(&args.iter().collect::<Vec<_>>()),
+            // Memory is left only where the compiler could not resolve it (a
+            // generic instance with `&mut` parameters standing in for `main`):
+            // a loaded value may come from anything stored before.
+            Kind::Other { opcode, .. } if opcode == "load" => Leaves::many(),
             kind => self.union_of(&kind.operands()),
         };
 
@@ -434,7 +447,15 @@ impl<'a> Graph<'a> {
         let mut seen: HashSet<Val> = hint.results.iter().copied().collect();
         let mut queue: Vec<Val> = hint.results.clone();
         let mut reached: BTreeSet<usize> = BTreeSet::new();
-        let mut truncated = false;
+        // A hint that reads or writes through a reference passes values through
+        // memory, which the walk cannot follow.
+        let by_reference = |v: &Val| self.type_of(*v).is_some_and(|t| t.starts_with('&'));
+        let mut truncated = hint
+            .args
+            .iter()
+            .filter_map(Operand::val)
+            .any(|v| by_reference(&v))
+            || hint.results.iter().any(by_reference);
         while let Some(v) = queue.pop() {
             if seen.len() > SLICE_BUDGET {
                 truncated = true;
@@ -443,6 +464,10 @@ impl<'a> Graph<'a> {
             for idx in self.uses.get(&v).into_iter().flatten() {
                 if !reached.insert(*idx) || self.is_hint_call.contains(idx) {
                     continue;
+                }
+                if matches!(&self.instrs[*idx].kind, Kind::Other { opcode, .. } if opcode == "store")
+                {
+                    truncated = true;
                 }
                 for result in &self.instrs[*idx].results {
                     if seen.insert(*result) {
@@ -523,6 +548,9 @@ impl<'a> Graph<'a> {
                 {
                     consider(*bits);
                 }
+                if let Some(bits) = self.asserted_below(*idx, value) {
+                    consider(bits);
+                }
             }
             current = match self.def(value).map(|i| &i.kind) {
                 Some(Kind::Cast {
@@ -541,10 +569,49 @@ impl<'a> Graph<'a> {
                     if let Kind::RangeCheck { bits, .. } = &self.instrs[*use_idx].kind {
                         consider(*bits);
                     }
+                    if let Some(bits) = self.asserted_below(*use_idx, *result) {
+                        consider(bits);
+                    }
                 }
             }
         }
         best
+    }
+
+    /// The bits `value` fits in when instruction `idx` is `value < C` for a
+    /// constant `C` and the comparison is asserted true, as in the bounds
+    /// check of a read from a fixed-size table, or when it reads an array of
+    /// `C` scalars at index `value`, which ACIR bounds checks itself.
+    fn asserted_below(&self, idx: usize, value: Val) -> Option<u32> {
+        let instr = self.instrs[idx];
+        if let Kind::ArrayGet {
+            array: Operand::Val(array),
+            index: Operand::Val(index),
+        } = &instr.kind
+        {
+            let typ = self.type_of(*array)?;
+            let scalar = typ
+                .strip_prefix('[')
+                .is_some_and(|t| !t.starts_with(['[', '(']));
+            let len = array_len(typ).filter(|len| *len > 0 && scalar)?;
+            return (*index == value).then(|| BigInt::from(len - 1).bits() as u32);
+        }
+        let Kind::Binary {
+            op: BinOp::Lt,
+            lhs: Operand::Val(x),
+            rhs: Operand::Const { value: limit, .. },
+            ..
+        } = &instr.kind
+        else {
+            return None;
+        };
+        let result = instr.results.first()?;
+        let asserted = self.uses.get(result).into_iter().flatten().any(|i| {
+            matches!(&self.instrs[*i].kind, Kind::Constrain { lhs: Operand::Val(r), rhs, .. }
+                if r == result && rhs.constant().is_some_and(|c| !c.is_zero()))
+        });
+        (*x == value && asserted && limit.is_positive())
+            .then(|| (limit - BigInt::one()).bits() as u32)
     }
 
     /// Linear view of a value, looking through additions, subtractions,
@@ -854,6 +921,58 @@ brillig(inline) fn hint f1 {
         assert_eq!(g.is_boolean_check(g.constraints[0].instr), Some(v2));
         assert_eq!(g.is_boolean_check(g.constraints[1].instr), Some(v2));
         assert_eq!(g.is_boolean_check(g.constraints[2].instr), None);
+    }
+
+    #[test]
+    fn asserted_constant_bounds_prove_bits() {
+        let text = "acir(inline) fn main f0 {
+  b0(v0: Field):
+    v1 = call f1(v0) -> [u32; 2]
+    v2 = array_get v1, index u32 0 -> u32
+    v3 = cast v2 as u64
+    v4 = lt v3, u64 32
+    constrain v4 == u1 1, \"Index out of bounds\"
+    return
+}
+brillig(inline) fn hint f1 {
+  b0(v0: Field):
+    return v0
+}
+";
+        let (program, id) = graph_of(text);
+        let g = Graph::build(&program, &program.functions[&id]);
+        let v2 = Val {
+            global: false,
+            id: 2,
+        };
+        assert_eq!(g.proven_bits(v2), Some(5));
+    }
+
+    #[test]
+    fn values_through_memory_are_not_followed() {
+        let text = "acir(inline) fn main f0 {
+  b0(v0: &mut Field, v1: Field):
+    v2 = call f1(v1) -> Field
+    store v2 at v0
+    v3 = load v0 -> Field
+    constrain v3 == v1
+    v4 = call f1(v1) -> Field
+    constrain v4 == Field 1
+    return
+}
+brillig(inline) fn hint f1 {
+  b0(v0: Field):
+    return v0
+}
+";
+        let (program, id) = graph_of(text);
+        let g = Graph::build(&program, &program.functions[&id]);
+        let val = |id| Val { global: false, id };
+        // A loaded value may come from anything stored before it.
+        assert!(g.leaves_of_val(val(3)).is_many());
+        // The first hint is stored, so its slice is incomplete; the second is not.
+        assert!(g.slice(&g.hints[0]).truncated);
+        assert!(!g.slice(&g.hints[1]).truncated);
     }
 
     #[test]

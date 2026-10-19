@@ -82,3 +82,14 @@ pub fn safe_5(arr: [Field; 4], needle: Field) {
     let i = unsafe { find_hint(arr, needle + 1) };
     assert(arr[i] == needle + 1);
 }
+
+// The look-alikes accept honest witnesses (run with `nargo test`).
+#[test]
+fn honest_inputs_pass() {
+    let arr = [10, 20, 30, 40];
+    safe_1(arr, 30);
+    safe_2(arr, [1, 2, 3, 4], 30);
+    safe_3(arr, 30);
+    safe_4(arr, 30);
+    safe_5(arr, 29);
+}

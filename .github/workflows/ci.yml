@@ -27,3 +27,18 @@ jobs:
           set +e
           cargo run --release -- lint --program-dir examples/vulnerable
           test $? -eq 2
+
+  corpus:
+    # The seeded suite checked by nargo itself: every look-alike accepts honest
+    # witnesses, and every exploit in tests/exploits gets a wrong witness past
+    # its vulnerable function and is rejected by the fix.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: noir-lang/noirup@v0.1.5
+        with:
+          toolchain: 1.0.0-rc.5
+      - run: |
+          for package in tests/corpus/*/ tests/exploits/; do
+            (cd "$package" && nargo test) || exit 1
+          done
