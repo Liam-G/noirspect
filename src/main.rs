@@ -33,6 +33,9 @@ enum Command {
     /// Internal: lower one package's entry points for a parent process
     #[command(name = "__lower", hide = true)]
     Lower(LowerArgs),
+    /// Internal: run the rules over a saved `noirspect ssa` dump and report timing
+    #[command(name = "__analyze-ssa", hide = true)]
+    AnalyzeSsa { file: PathBuf },
 }
 
 #[derive(clap::Args)]
@@ -244,6 +247,45 @@ fn lint(args: &LintArgs) -> Result<ExitCode, String> {
     })
 }
 
+fn analyze_ssa_file(file: &Path) -> Result<ExitCode, String> {
+    let started = std::time::Instant::now();
+    let text = std::fs::read_to_string(file)
+        .map_err(|e| format!("cannot read {}: {e}", file.display()))?;
+    let rss = || {
+        std::fs::read_to_string("/proc/self/statm")
+            .ok()
+            .and_then(|s| s.split_whitespace().nth(1)?.parse::<u64>().ok())
+            .map_or(0, |pages| pages * 4096 / (1024 * 1024))
+    };
+    let program = noirspect::ssa::parse_program(&text);
+    drop(text);
+    let parsed = started.elapsed();
+    eprintln!("parsed: {} MiB", rss());
+    let mut findings = 0;
+    for func in program.acir_functions() {
+        let g = noirspect::graph::Graph::build(&program, func);
+        eprintln!("graph of {}: {} MiB", func.name, rss());
+        let found = noirspect::rules::check_function(&g);
+        findings += found.len();
+        eprintln!("rules on {}: {} MiB", func.name, rss());
+        let mut distinct: std::collections::BTreeMap<(String, String), usize> = Default::default();
+        for f in &found {
+            let loc = f.loc.as_ref().map(|l| l.to_string()).unwrap_or_default();
+            *distinct.entry((f.rule.to_string(), loc)).or_default() += 1;
+        }
+        for ((rule, loc), count) in distinct {
+            eprintln!("  {rule} {loc} x{count}");
+        }
+    }
+    eprintln!(
+        "{} functions, {findings} findings; parsed in {:.1}s, analyzed in {:.1}s",
+        program.functions.len(),
+        parsed.as_secs_f64(),
+        (started.elapsed() - parsed).as_secs_f64()
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
 fn print_ssa(target: &TargetArgs) -> Result<ExitCode, String> {
     let options = options(target, &Policy::default());
     let workspace = noirspect::driver::load(&noirspect::driver::LoadOptions {
@@ -278,6 +320,7 @@ fn main() -> ExitCode {
             Ok(ExitCode::SUCCESS)
         }
         Command::Ssa(target) => print_ssa(target),
+        Command::AnalyzeSsa { file } => analyze_ssa_file(file),
         Command::Lower(args) => noirspect::driver::worker_main(
             &args.program_dir,
             &args.package,

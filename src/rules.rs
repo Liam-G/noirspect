@@ -1,6 +1,8 @@
 //! The rule catalogue and the SSA-level rules.
 
-use crate::graph::{Atom, ConstraintKind, Graph, HintCall, Leaf, Leaves, ratio_bits};
+use crate::graph::{
+    Atom, Constraint, ConstraintKind, Graph, HintCall, HintSlice, Leaf, Leaves, ratio_bits,
+};
 use crate::ssa::{BinOp, Kind, Loc, Operand, int_bits, is_array, is_field};
 use num_bigint::BigInt;
 use num_traits::{Signed, Zero};
@@ -172,7 +174,7 @@ struct Ctx<'g, 'a> {
     returned: Leaves,
 }
 
-impl Ctx<'_, '_> {
+impl<'g> Ctx<'g, '_> {
     fn related(&self, idx: usize, label: &str) -> Vec<Related> {
         self.g
             .loc(idx)
@@ -205,9 +207,27 @@ impl Ctx<'_, '_> {
     }
 
     fn escapes(&self, leaves: impl IntoIterator<Item = Leaf>) -> bool {
-        leaves
-            .into_iter()
-            .any(|l| self.returned.contains(&l) || self.returned.contains(&base(l)))
+        leaves.into_iter().any(|l| {
+            let exact = |leaf: &Leaf| self.returned.exact().is_some_and(|set| set.contains(leaf));
+            // The summary of all returned leaves is cheap but coarse; walk
+            // forward from the leaf when it cannot answer.
+            exact(&l)
+                || exact(&base(l))
+                || (self.returned.is_many() && self.g.leaf_may_reach_return(l))
+        })
+    }
+
+    /// The forward slice of the hint at `call`, computed on demand.
+    fn slice(&self, call: usize) -> HintSlice {
+        self.g.slice(self.hint(call))
+    }
+
+    fn hint(&self, call: usize) -> &'g HintCall {
+        self.g
+            .hints
+            .iter()
+            .find(|h| h.instr == call)
+            .expect("hint call")
     }
 }
 
@@ -233,13 +253,15 @@ pub fn check_function(g: &Graph) -> Vec<Finding> {
         findings: Vec::new(),
         returned: g.returned_leaves(),
     };
+    // One hint's slice at a time: large circuits have tens of thousands of hints.
     for hint in &g.hints {
-        constant_only(&mut ctx, hint);
-        one_sided_is_zero(&mut ctx, hint);
-        inverse_only_is_zero(&mut ctx, hint);
-        unchecked_index(&mut ctx, hint);
-        half_checked_sort(&mut ctx, hint);
-        one_directional_bound(&mut ctx, hint);
+        let slice = g.slice(hint);
+        constant_only(&mut ctx, hint, &slice);
+        one_sided_is_zero(&mut ctx, hint, &slice);
+        inverse_only_is_zero(&mut ctx, hint, &slice);
+        unchecked_index(&mut ctx, hint, &slice);
+        half_checked_sort(&mut ctx, hint, &slice);
+        one_directional_bound(&mut ctx, hint, &slice);
     }
     for c in &g.constraints {
         if c.kind == ConstraintKind::Equal {
@@ -251,24 +273,51 @@ pub fn check_function(g: &Graph) -> Vec<Finding> {
     ctx.findings
 }
 
-/// NUC-001: every constraint touching the hint involves only the hint and constants.
-fn constant_only(ctx: &mut Ctx, hint: &HintCall) {
-    let g = ctx.g;
-    if !has_live_args(g, hint) {
-        return;
-    }
-    // A hinted index is NUC-005's concern.
-    let used_as_index = g.instrs.iter().any(|i| {
-        matches!(&i.kind, Kind::ArrayGet { index, .. } if g.touches_call(&g.leaves_of(index), hint.instr))
-    }) || g.constraints.iter().any(|c| c.bounds_check && g.touches_call(&c.leaves, hint.instr));
-    if used_as_index {
-        return;
-    }
-    let touching: Vec<_> = g
+/// The constraints a hint's slice reaches, other than array bounds checks.
+fn touching<'g>(g: &'g Graph, slice: &'g HintSlice) -> impl Iterator<Item = &'g Constraint> + 'g {
+    slice
         .constraints
         .iter()
-        .filter(|c| !c.bounds_check && g.touches_call(&c.leaves, hint.instr))
-        .collect();
+        .map(|i| &g.constraints[*i])
+        .filter(|c| !c.bounds_check)
+}
+
+/// The hint's values reach an array index (NUC-005's concern).
+fn used_as_index(g: &Graph, slice: &HintSlice, call: usize) -> bool {
+    slice.instrs.iter().any(|i| {
+        matches!(&g.instrs[*i].kind, Kind::ArrayGet { index, .. } if g.leaves_of(index).may_touch_call(call))
+    }) || slice
+        .constraints
+        .iter()
+        .any(|i| g.constraints[*i].bounds_check)
+}
+
+/// The `lt` comparisons a slice reaches, as (instruction, lhs, rhs).
+fn comparisons<'g>(
+    g: &'g Graph,
+    slice: &'g HintSlice,
+) -> impl Iterator<Item = (usize, &'g Operand, &'g Operand)> + 'g {
+    slice
+        .instrs
+        .iter()
+        .filter_map(|i| match &g.instrs[*i].kind {
+            Kind::Binary {
+                op: BinOp::Lt,
+                lhs,
+                rhs,
+                ..
+            } => Some((*i, lhs, rhs)),
+            _ => None,
+        })
+}
+
+/// NUC-001: every constraint touching the hint involves only the hint and constants.
+fn constant_only(ctx: &mut Ctx, hint: &HintCall, slice: &HintSlice) {
+    let g = ctx.g;
+    if !has_live_args(g, hint) || slice.truncated || used_as_index(g, slice, hint.instr) {
+        return;
+    }
+    let touching: Vec<_> = touching(g, slice).collect();
     if touching.is_empty() {
         return;
     }
@@ -277,7 +326,7 @@ fn constant_only(ctx: &mut Ctx, hint: &HintCall) {
     // constant-only check either; NUC-006 covers that shape.
     let linked = touching
         .iter()
-        .any(|c| c.leaves.iter().any(|l| l.hint_call() != Some(hint.instr)) || c.leaves.len() > 1);
+        .any(|c| c.leaves.may_reach_beyond(hint.instr) || c.leaves.may_be_several());
     if linked {
         return;
     }
@@ -306,7 +355,7 @@ fn missing_remainder_bound(ctx: &mut Ctx, idx: usize) {
             };
             let call = q_leaf.hint_call().expect("hint leaf");
             let d_leaves = g.leaves_of_val(d);
-            if d_leaves.is_empty() || g.touches_call(&d_leaves, call) {
+            if d_leaves.is_empty() || d_leaves.may_touch_call(call) {
                 continue;
             }
             let remainder = eq.terms.iter().find_map(|(other, c)| match other {
@@ -322,28 +371,21 @@ fn missing_remainder_bound(ctx: &mut Ctx, idx: usize) {
             let rest_from_outside = eq.terms.keys().any(|other| {
                 *other != *atom
                     && *other != Atom::Value(r)
-                    && !g
-                        .atom_leaves(other)
-                        .iter()
-                        .any(|l| l.hint_call() == Some(call))
+                    && !g.atom_leaves(other).may_touch_call(call)
             });
             if !rest_from_outside {
                 continue;
             }
-            if remainder_is_bounded(g, r, d, idx) {
+            let slice = ctx.slice(call);
+            if slice.truncated || remainder_is_bounded(g, &slice, r, d, idx) {
                 return;
             }
-            let hint = g
-                .hints
-                .iter()
-                .find(|h| h.instr == call)
-                .expect("hint call")
-                .clone();
+            let hint = ctx.hint(call);
             let escapes = ctx.escapes([r_leaf]);
             let related = ctx.related(idx, "recombined here without bounding the remainder");
             ctx.push(
                 "NUC-002",
-                &hint,
+                hint,
                 format!(
                     "the remainder from `{}` is recombined as `q * d + r` but never checked to be less than the divisor",
                     hint.callee
@@ -356,9 +398,14 @@ fn missing_remainder_bound(ctx: &mut Ctx, idx: usize) {
     }
 }
 
-fn derived_from(g: &Graph, op: &Operand, target: &Leaves) -> bool {
-    let leaves = g.leaves_of(op);
-    !target.is_empty() && target.is_subset(&leaves)
+/// `op` may be computed from all of `target` (true when unknown).
+fn may_derive_from(g: &Graph, op: &Operand, target: &Leaves) -> bool {
+    !target.is_empty() && g.leaves_of(op).may_include(target)
+}
+
+/// `op` is certainly computed from all of `target`.
+fn surely_derives_from(g: &Graph, op: &Operand, target: &Leaves) -> bool {
+    g.leaves_of(op).surely_includes(target)
 }
 
 /// `r < d` in some form: a comparison, a checked unsigned `d - r`, or (for
@@ -366,6 +413,7 @@ fn derived_from(g: &Graph, op: &Operand, target: &Leaves) -> bool {
 /// constraint relating the two, except a comparison the wrong way round.
 fn remainder_is_bounded(
     g: &Graph,
+    slice: &HintSlice,
     r: crate::ssa::Val,
     d: crate::ssa::Val,
     recombination: usize,
@@ -382,44 +430,56 @@ fn remainder_is_bounded(
         else {
             return false;
         };
-        derived_from(g, lhs, &d_leaves) && derived_from(g, rhs, &r_leaves)
+        surely_derives_from(g, lhs, &d_leaves) && surely_derives_from(g, rhs, &r_leaves)
     };
-    let related = g.constraints.iter().any(|c| {
-        let relates = c.instr != recombination
-            && !c.bounds_check
-            && c.kind != ConstraintKind::NotEqual
-            && r_leaves.is_subset(&c.leaves)
-            && d_leaves.is_subset(&c.leaves);
-        relates
-            && match &g.instrs[c.instr].kind {
-                Kind::Constrain { lhs, rhs, .. } => !wrong_way(lhs) && !wrong_way(rhs),
-                _ => true,
-            }
-    });
+    let related = slice
+        .constraints
+        .iter()
+        .map(|i| &g.constraints[*i])
+        .any(|c| {
+            let relates = c.instr != recombination
+                && !c.bounds_check
+                && c.kind != ConstraintKind::NotEqual
+                && c.leaves.may_include(&r_leaves)
+                && c.leaves.may_include(&d_leaves);
+            relates
+                && match &g.instrs[c.instr].kind {
+                    Kind::Constrain { lhs, rhs, .. } => !wrong_way(lhs) && !wrong_way(rhs),
+                    _ => true,
+                }
+        });
     if related {
         return true;
     }
-    let compares = g.comparisons().any(|(_, lhs, rhs)| {
-        derived_from(g, lhs, &r_leaves)
-            && derived_from(g, rhs, &d_leaves)
-            && !g.touches_call(&g.leaves_of(rhs), r_call(g, r))
+    let call = r_call(g, r);
+    let compares = comparisons(g, slice).any(|(_, lhs, rhs)| {
+        may_derive_from(g, lhs, &r_leaves)
+            && may_derive_from(g, rhs, &d_leaves)
+            && !g
+                .leaves_of(rhs)
+                .exact()
+                .is_some_and(|l| l.iter().any(|x| x.hint_call() == Some(call)))
     });
-    let subtracts = g.instrs.iter().any(|i| match &i.kind {
-        Kind::Binary {
-            op: BinOp::Sub,
-            unchecked: false,
-            lhs,
-            rhs,
-        } => {
-            let unsigned = i
-                .results
-                .first()
-                .and_then(|v| g.type_of(*v))
-                .is_some_and(|t| t.starts_with('u'));
-            unsigned && derived_from(g, lhs, &d_leaves) && derived_from(g, rhs, &r_leaves)
-        }
-        _ => false,
-    });
+    let subtracts = slice
+        .instrs
+        .iter()
+        .map(|i| g.instrs[*i])
+        .any(|i| match &i.kind {
+            Kind::Binary {
+                op: BinOp::Sub,
+                unchecked: false,
+                lhs,
+                rhs,
+            } => {
+                let unsigned = i
+                    .results
+                    .first()
+                    .and_then(|v| g.type_of(*v))
+                    .is_some_and(|t| t.starts_with('u'));
+                unsigned && may_derive_from(g, lhs, &d_leaves) && may_derive_from(g, rhs, &r_leaves)
+            }
+            _ => false,
+        });
     compares || subtracts
 }
 
@@ -469,7 +529,12 @@ fn unchecked_decomposition(ctx: &mut Ctx, idx: usize) {
             let needed = widths.get(i).copied().flatten();
             let ok = match needed {
                 Some(width) => limb_bound(g, *v).is_some_and(|bits| bits <= width),
-                None => limb_bound(g, *v).is_some() || is_bounded_by_comparison(g, *v),
+                None => {
+                    limb_bound(g, *v).is_some() || {
+                        let slice = ctx.slice(call);
+                        slice.truncated || is_bounded_by_comparison(g, &slice, *v)
+                    }
+                }
             };
             if !ok {
                 unchecked.push(*leaf);
@@ -478,17 +543,12 @@ fn unchecked_decomposition(ctx: &mut Ctx, idx: usize) {
         if unchecked.is_empty() {
             continue;
         }
-        let hint = g
-            .hints
-            .iter()
-            .find(|h| h.instr == call)
-            .expect("hint call")
-            .clone();
+        let hint = ctx.hint(call);
         let escapes = ctx.escapes(unchecked.iter().copied());
         let related = ctx.related(idx, "recombined here");
         ctx.push(
             "NUC-003",
-            &hint,
+            hint,
             format!(
                 "{} of {} limbs from `{}` are recombined into an input without a range check to their width",
                 unchecked.len(),
@@ -503,31 +563,37 @@ fn unchecked_decomposition(ctx: &mut Ctx, idx: usize) {
 
 /// Bits a limb is proven to fit in: its type, a range check, or a boolean check.
 fn limb_bound(g: &Graph, v: crate::ssa::Val) -> Option<u32> {
-    let mut best = g.proven_bits(v);
     let stripped = g.strip_casts(v);
-    let boolean = g
-        .constraints
-        .iter()
-        .any(|c| g.is_boolean_check(c.instr) == Some(stripped));
-    if boolean {
-        best = Some(1);
+    if g.boolean_checked().contains(&stripped) {
+        return Some(1);
     }
-    if let Some(bits) = g.proven_bits(stripped) {
-        best = Some(best.map_or(bits, |b| b.min(bits)));
+    match (g.proven_bits(v), g.proven_bits(stripped)) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
     }
-    best
 }
 
-fn is_bounded_by_comparison(g: &Graph, v: crate::ssa::Val) -> bool {
+fn is_bounded_by_comparison(g: &Graph, slice: &HintSlice, v: crate::ssa::Val) -> bool {
     let leaves = g.leaves_of_val(v);
-    g.comparisons()
-        .any(|(_, lhs, rhs)| g.leaves_of(lhs) == leaves || g.leaves_of(rhs) == leaves)
+    comparisons(g, slice).any(|(_, lhs, rhs)| {
+        g.leaves_of(lhs).may_equal(&leaves) || g.leaves_of(rhs).may_equal(&leaves)
+    })
+}
+
+/// Another constraint ties the hint down, beyond `except` and boolean checks.
+fn has_other_checks(g: &Graph, slice: &HintSlice, except: usize) -> bool {
+    slice.truncated
+        || touching(g, slice).any(|o| {
+            o.instr != except
+                && !matches!(o.kind, ConstraintKind::Range(_))
+                && g.is_boolean_check(o.instr).is_none()
+        })
 }
 
 /// NUC-004: `x · flag == 0` is the only constraint tying the hint to `x`.
-fn one_sided_is_zero(ctx: &mut Ctx, hint: &HintCall) {
+fn one_sided_is_zero(ctx: &mut Ctx, hint: &HintCall, slice: &HintSlice) {
     let g = ctx.g;
-    for c in &g.constraints {
+    for c in touching(g, slice) {
         let Some(eq) = g.equation(c.instr) else {
             continue;
         };
@@ -545,17 +611,10 @@ fn one_sided_is_zero(ctx: &mut Ctx, hint: &HintCall) {
                 continue;
             }
             let x_leaves = g.leaves_of_val(x);
-            if x_leaves.is_empty() || g.touches_call(&x_leaves, hint.instr) {
+            if x_leaves.is_empty() || x_leaves.may_touch_call(hint.instr) {
                 continue;
             }
-            let other_checks = g.constraints.iter().any(|o| {
-                o.instr != c.instr
-                    && !o.bounds_check
-                    && !matches!(o.kind, ConstraintKind::Range(_))
-                    && g.touches_call(&o.leaves, hint.instr)
-                    && g.is_boolean_check(o.instr).is_none()
-            });
-            if other_checks {
+            if has_other_checks(g, slice, c.instr) {
                 return;
             }
             let related = ctx.related(c.instr, "only `x * flag == 0` is asserted here");
@@ -576,9 +635,9 @@ fn one_sided_is_zero(ctx: &mut Ctx, hint: &HintCall) {
 
 /// NUC-004, other side: `x · inv == 1 - flag` alone. For `x ≠ 0` the prover
 /// picks `inv = 0` and with it `flag = 1`, claiming `x` is zero.
-fn inverse_only_is_zero(ctx: &mut Ctx, hint: &HintCall) {
+fn inverse_only_is_zero(ctx: &mut Ctx, hint: &HintCall, slice: &HintSlice) {
     let g = ctx.g;
-    for c in &g.constraints {
+    for c in touching(g, slice) {
         let Some(eq) = g.equation(c.instr) else {
             continue;
         };
@@ -610,19 +669,12 @@ fn inverse_only_is_zero(ctx: &mut Ctx, hint: &HintCall) {
             let x_leaves = g.leaves_of_val(*x);
             from_hint(*inv).is_some_and(|l| l != flag_leaf)
                 && !x_leaves.is_empty()
-                && !g.touches_call(&x_leaves, hint.instr)
+                && !x_leaves.may_touch_call(hint.instr)
         });
         if shape.is_none() {
             continue;
         }
-        let other_checks = g.constraints.iter().any(|o| {
-            o.instr != c.instr
-                && !o.bounds_check
-                && !matches!(o.kind, ConstraintKind::Range(_))
-                && g.touches_call(&o.leaves, hint.instr)
-                && g.is_boolean_check(o.instr).is_none()
-        });
-        if other_checks {
+        if has_other_checks(g, slice, c.instr) {
             return;
         }
         let related = ctx.related(c.instr, "only `x * inv == 1 - flag` is asserted here");
@@ -673,16 +725,14 @@ fn comparison_bound(g: &Graph, c: usize, call: usize) -> Option<Bound> {
         return None;
     };
     let (hint_on_a, hint_on_b) = (
-        g.touches_call(&g.leaves_of(a), call),
-        g.touches_call(&g.leaves_of(b), call),
+        g.leaves_of(a).may_touch_call(call),
+        g.leaves_of(b).may_touch_call(call),
     );
     let increasing = |side: &Operand| {
-        g.linear(side).terms.iter().all(|(atom, coeff)| {
-            !g.atom_leaves(atom)
-                .iter()
-                .any(|l| l.hint_call() == Some(call))
-                || coeff.is_positive()
-        })
+        g.linear(side)
+            .terms
+            .iter()
+            .all(|(atom, coeff)| !g.atom_leaves(atom).may_touch_call(call) || coeff.is_positive())
     };
     // `a < b` holds when `holds`, otherwise `a >= b`.
     match (hint_on_a, hint_on_b) {
@@ -693,25 +743,13 @@ fn comparison_bound(g: &Graph, c: usize, call: usize) -> Option<Bound> {
 }
 
 /// NUC-009: every constraint tying the hint to its inputs is a comparison in the same direction.
-fn one_directional_bound(ctx: &mut Ctx, hint: &HintCall) {
+fn one_directional_bound(ctx: &mut Ctx, hint: &HintCall, slice: &HintSlice) {
     let g = ctx.g;
-    if !has_live_args(g, hint) {
+    if !has_live_args(g, hint) || slice.truncated || used_as_index(g, slice, hint.instr) {
         return;
     }
-    let used_as_index = g.instrs.iter().any(|i| {
-        matches!(&i.kind, Kind::ArrayGet { index, .. } if g.touches_call(&g.leaves_of(index), hint.instr))
-    });
-    if used_as_index {
-        return;
-    }
-    let linking: Vec<_> = g
-        .constraints
-        .iter()
-        .filter(|c| {
-            !c.bounds_check
-                && g.touches_call(&c.leaves, hint.instr)
-                && c.leaves.iter().any(|l| l.hint_call() != Some(hint.instr))
-        })
+    let linking: Vec<_> = touching(g, slice)
+        .filter(|c| c.leaves.may_reach_beyond(hint.instr))
         .collect();
     let mut directions = BTreeSet::new();
     for c in &linking {
@@ -747,8 +785,23 @@ fn one_directional_bound(ctx: &mut Ctx, hint: &HintCall) {
 }
 
 /// NUC-005: a hint index reads an array, but nothing compares the element read to the needle.
-fn unchecked_index(ctx: &mut Ctx, hint: &HintCall) {
+fn unchecked_index(ctx: &mut Ctx, hint: &HintCall, slice: &HintSlice) {
     let g = ctx.g;
+    if slice.truncated {
+        return;
+    }
+    let needle = hint
+        .args
+        .iter()
+        .filter(|a| {
+            a.val()
+                .and_then(|v| g.type_of(v))
+                .is_some_and(|t| !is_array(t))
+        })
+        .fold(Leaves::default(), |acc, a| acc.union(&g.leaves_of(a)));
+    if needle.is_empty() {
+        return;
+    }
     for pos in 0..hint.results.len() {
         let Some(bits) = hint.result_types.get(pos).and_then(|t| int_bits(t)) else {
             continue;
@@ -761,41 +814,22 @@ fn unchecked_index(ctx: &mut Ctx, hint: &HintCall) {
             pos,
             elem: None,
         };
-        let mut read_at = None;
-        for (idx, instr) in g.instrs.iter().enumerate() {
-            if let Kind::ArrayGet { array, index } = &instr.kind
-                && g.leaves_of(index).contains(&leaf)
-                && !g.leaves_of(array).is_empty()
-                && !g.touches_call(&g.leaves_of(array), hint.instr)
-            {
-                read_at.get_or_insert(idx);
-            }
-        }
-        let bounds = g
+        let read_at = slice.instrs.iter().copied().find(|i| {
+            matches!(&g.instrs[*i].kind, Kind::ArrayGet { array, index }
+                if g.leaves_of(index).exact().is_some_and(|l| l.contains(&leaf))
+                    && !g.leaves_of(array).is_empty()
+                    && !g.leaves_of(array).may_touch_call(hint.instr))
+        });
+        let bounds = slice
             .constraints
             .iter()
-            .find(|c| c.bounds_check && c.leaves.contains(&leaf));
+            .map(|i| &g.constraints[*i])
+            .find(|c| c.bounds_check && c.leaves.exact().is_some_and(|l| l.contains(&leaf)));
         let Some(read_idx) = read_at.or(bounds.map(|c| c.instr)) else {
             continue;
         };
-        let needle: Leaves = hint
-            .args
-            .iter()
-            .filter(|a| {
-                a.val()
-                    .and_then(|v| g.type_of(v))
-                    .is_some_and(|t| !is_array(t))
-            })
-            .flat_map(|a| g.leaves_of(a))
-            .collect();
-        if needle.is_empty() {
-            continue;
-        }
-        let compared = g.constraints.iter().any(|c| {
-            !c.bounds_check
-                && c.leaves.contains(&leaf)
-                && c.leaves.iter().any(|l| needle.contains(l))
-        });
+        let compared = touching(g, slice)
+            .any(|c| c.leaves.may_contain(&leaf) && c.leaves.may_intersect(&needle));
         if compared {
             continue;
         }
@@ -815,15 +849,18 @@ fn unchecked_index(ctx: &mut Ctx, hint: &HintCall) {
 }
 
 /// NUC-006: a hinted sorted array is checked for order but not permutation, or the reverse.
-fn half_checked_sort(ctx: &mut Ctx, hint: &HintCall) {
+fn half_checked_sort(ctx: &mut Ctx, hint: &HintCall, slice: &HintSlice) {
     let g = ctx.g;
+    if slice.truncated {
+        return;
+    }
     let inputs: Vec<(Leaves, &str)> = hint
         .args
         .iter()
         .filter_map(|a| {
             let typ = g.type_of(a.val()?)?;
             let leaves = g.leaves_of(a);
-            (is_array(typ) && !leaves.is_empty() && !g.touches_call(&leaves, hint.instr))
+            (is_array(typ) && !leaves.is_empty() && !leaves.may_touch_call(hint.instr))
                 .then_some((leaves, typ))
         })
         .collect();
@@ -832,28 +869,35 @@ fn half_checked_sort(ctx: &mut Ctx, hint: &HintCall) {
             continue;
         };
         let of_output = |op: &Operand| matches!(g.hint_value(op), Some(Leaf::Hint { call, pos: p, elem: Some(_) }) if call == hint.instr && p == pos);
-        let order_check = g.comparisons().find(|(_, lhs, rhs)| {
+        let order_check = comparisons(g, slice).find(|(_, lhs, rhs)| {
             of_output(lhs) && of_output(rhs) && g.hint_value(lhs) != g.hint_value(rhs)
         });
-        let touches_output = |leaves: &Leaves| {
-            leaves.iter().any(|l| matches!(l, Leaf::Hint { call, pos: p, .. } if *call == hint.instr && *p == pos))
-        };
-        let permutation = g.constraints.iter().any(|c| {
-            !c.bounds_check
-                && touches_output(&c.leaves)
-                && c.leaves.iter().any(|l| input.contains(l))
-        });
+        let output_leaf = |l: &Leaf| matches!(l, Leaf::Hint { call, pos: p, .. } if *call == hint.instr && *p == pos);
+        let mut permutation_maybe = false;
+        let mut permutation_surely = false;
+        for c in touching(g, slice) {
+            match c.leaves.exact() {
+                Some(leaves) => {
+                    if leaves.iter().any(output_leaf) && c.leaves.may_intersect(input) {
+                        permutation_maybe = true;
+                        permutation_surely |= !input.is_many();
+                    }
+                }
+                None => permutation_maybe = true,
+            }
+        }
         // An index map (outputs used to index arrays) is not itself a sorted array.
-        let used_as_index = g
-            .instrs
-            .iter()
-            .any(|i| matches!(&i.kind, Kind::ArrayGet { index, .. } if of_output(index)));
-        let message = match (order_check, permutation) {
-            (Some(_), false) => format!(
+        let used_as_index = slice.instrs.iter().any(
+            |i| matches!(&g.instrs[*i].kind, Kind::ArrayGet { index, .. } if of_output(index)),
+        );
+        let message = match (order_check, permutation_maybe, permutation_surely) {
+            (Some(_), false, _) => format!(
                 "the array from `{}` is checked to be ordered but never shown to be a permutation of the input",
                 hint.callee
             ),
-            (None, true) if !used_as_index && hint.callee.to_ascii_lowercase().contains("sort") => {
+            (None, _, true)
+                if !used_as_index && hint.callee.to_ascii_lowercase().contains("sort") =>
+            {
                 format!(
                     "the array from `{}` is checked against the input but its order is never checked",
                     hint.callee

@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.2.1 - 2026-10-19
+
+- Fix memory exhaustion on very large circuits. A package with benchmark
+  circuits of tens of thousands of hints and over a million SSA instructions
+  made 0.2.0 grow past 19 GiB and get killed by the operating system:
+  - on Linux each worker gets a share of memory; an entry that outgrows it is
+    stopped and retried at the end on its own, with most of the free memory;
+  - workers are replaced after 256 entries, or once they have grown 2 GiB
+    since loading the crate, because the compiler keeps memory from every
+    entry it lowers;
+  - leaf sets are shared between values and summarized past 64 leaves, and
+    each hint's forward slice (bounded to 5,000 values) is computed when its
+    rules run instead of all at once. Summaries and bounded slices can only
+    hide a finding, never add one.
+- Make `--entry-timeout` the total time an entry may take, including a first
+  attempt that was stopped for memory.
+- Decide whether a library function returns an unchecked value with a forward
+  walk from that value, so large returned arrays no longer hide findings.
+
 ## 0.2.0 - 2026-10-19
 
 - Add NUC-009 One-directional bound: hint results tied to their inputs only by

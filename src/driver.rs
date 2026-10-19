@@ -405,13 +405,36 @@ struct Session {
     stdin: std::process::ChildStdin,
     lines: mpsc::Receiver<String>,
     lowered: usize,
+    /// Resident memory once the crate is loaded and planned.
+    baseline: Option<u64>,
 }
 
 /// The compiler keeps memory from every entry a worker lowers, so a worker is
-/// replaced once it grows past this (Linux, where its size can be read) ...
-const WORKER_RECYCLE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// replaced once it has grown this much since it loaded the crate (Linux,
+/// where its size can be read) ...
+const WORKER_RECYCLE_GROWTH: u64 = 2 * 1024 * 1024 * 1024;
 /// ... or after this many entries everywhere.
-const WORKER_RECYCLE_ENTRIES: usize = 32;
+const WORKER_RECYCLE_ENTRIES: usize = 256;
+
+enum Outcome {
+    Done(Result<String, String>),
+    /// The worker died; the message says how.
+    Failed(String),
+    /// The entry used up its time budget.
+    TimedOut,
+    /// The worker outgrew its memory share and was stopped.
+    OverMemory,
+}
+
+/// A `/proc/meminfo` field in bytes, where the platform exposes it.
+fn meminfo_bytes(field: &str) -> Option<u64> {
+    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let line = text.lines().find(|l| l.starts_with(field))?;
+    let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kib * 1024)
+}
+
+const GIB: u64 = 1024 * 1024 * 1024;
 
 /// Resident memory of a process, where the platform exposes it.
 fn resident_bytes(pid: u32) -> Option<u64> {
@@ -461,6 +484,7 @@ impl Session {
             stdin,
             lines,
             lowered: 0,
+            baseline: None,
         };
         // Loading and checking the crate counts against the same time budget.
         let header = session
@@ -470,7 +494,10 @@ impl Session {
             .and_then(|line| serde_json::from_str::<WorkerPlan>(&line).ok());
         let expected: Vec<&str> = plan.iter().map(|e| e.name.as_str()).collect();
         match header {
-            Some(header) if header.plan == expected => Ok(session),
+            Some(header) if header.plan == expected => {
+                session.baseline = resident_bytes(session.child.id());
+                Ok(session)
+            }
             Some(_) => {
                 session.kill();
                 Err(
@@ -485,35 +512,40 @@ impl Session {
         }
     }
 
-    /// Lower one entry; `Err` means the worker is gone (timed out or crashed).
-    fn lower(&mut self, index: usize, timeout: Duration) -> Result<Result<String, String>, String> {
+    /// Lower one entry. The worker is gone after anything but `Done`.
+    fn lower(&mut self, index: usize, timeout: Duration, memory_cap: Option<u64>) -> Outcome {
         if writeln!(self.stdin, "{index}")
             .and_then(|_| self.stdin.flush())
             .is_err()
         {
-            return Err("the compiler crashed on this entry".to_string());
+            return Outcome::Failed("the compiler crashed on this entry".to_string());
         }
+        let started = std::time::Instant::now();
         loop {
-            match self.lines.recv_timeout(timeout) {
+            match self.lines.recv_timeout(Duration::from_secs(1)) {
                 Ok(line) => {
                     let Ok(parsed) = serde_json::from_str::<WorkerLine>(&line) else {
                         continue;
                     };
                     if parsed.index == index {
-                        return Ok(match (parsed.ssa, parsed.error) {
+                        return Outcome::Done(match (parsed.ssa, parsed.error) {
                             (Some(ssa), _) => Ok(ssa),
                             (None, error) => Err(error.unwrap_or_default()),
                         });
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    return Err(format!(
-                        "lowering took longer than {}s; skipped",
-                        timeout.as_secs()
-                    ));
+                    if started.elapsed() >= timeout {
+                        return Outcome::TimedOut;
+                    }
+                    if let (Some(cap), Some(used)) = (memory_cap, resident_bytes(self.child.id()))
+                        && used > cap
+                    {
+                        return Outcome::OverMemory;
+                    }
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err("the compiler crashed on this entry".to_string());
+                    return Outcome::Failed("the compiler crashed on this entry".to_string());
                 }
             }
         }
@@ -526,8 +558,11 @@ impl Session {
 
     /// Whether the worker has grown enough that a fresh one would be cheaper.
     fn worn_out(&self) -> bool {
-        self.lowered >= WORKER_RECYCLE_ENTRIES
-            || resident_bytes(self.child.id()).is_some_and(|bytes| bytes > WORKER_RECYCLE_BYTES)
+        let grown = match (self.baseline, resident_bytes(self.child.id())) {
+            (Some(base), Some(now)) => now.saturating_sub(base) > WORKER_RECYCLE_GROWTH,
+            _ => false,
+        };
+        self.lowered >= WORKER_RECYCLE_ENTRIES || grown
     }
 
     fn finish(mut self) {
@@ -538,8 +573,13 @@ impl Session {
 
 /// Lower `plan` in up to `worker.jobs` long-lived worker processes, handing
 /// out one entry at a time so slow entries do not hold up the others. An
-/// entry over budget kills its worker, is skipped, and a fresh worker takes
-/// over the rest of that job's share.
+/// entry over budget kills its worker and is skipped.
+///
+/// Some circuits need many gigabytes to compile, and several of them at once
+/// can exhaust the machine. Each worker therefore gets a share of memory; an
+/// entry that outgrows it is put aside and retried at the end, alone, with
+/// most of the memory then available. `--entry-timeout` is the total time an
+/// entry may take, so the retry only gets what the first attempt left.
 fn lower_in_workers(
     worker: &Worker,
     options: &LoadOptions,
@@ -547,49 +587,135 @@ fn lower_in_workers(
     plan: &[PlannedEntry],
 ) -> Vec<EntrySsa> {
     let jobs = worker.jobs.clamp(1, plan.len().max(1));
-    let queue = std::sync::Mutex::new((0..plan.len()).rev().collect::<Vec<_>>());
+    let share = meminfo_bytes("MemTotal:").map(|total| (total / 2 / jobs as u64).max(2 * GIB));
+    let all: Vec<(usize, Duration)> = (0..plan.len()).map(|i| (i, worker.timeout)).collect();
+    let (mut results, deferred) = lower_pass(
+        worker,
+        options,
+        package,
+        plan,
+        &all,
+        jobs,
+        share.filter(|_| jobs > 1),
+    );
+    if !deferred.is_empty() {
+        let alone = meminfo_bytes("MemAvailable:").map(|available| available / 4 * 3);
+        let (retried, still_too_big) =
+            lower_pass(worker, options, package, plan, &deferred, 1, alone);
+        for (index, lowered) in retried.into_iter().enumerate() {
+            if lowered.is_some() {
+                results[index] = lowered;
+            }
+        }
+        for (index, _) in still_too_big {
+            let gib = alone.unwrap_or_default() as f64 / GIB as f64;
+            results[index] = Some(Err(format!(
+                "lowering needed more than {gib:.1} GiB of memory; skipped"
+            )));
+        }
+    }
+    plan.iter()
+        .zip(results)
+        .map(|(entry, ssa)| EntrySsa {
+            name: entry.name.clone(),
+            is_main: entry.is_main,
+            ssa: ssa.unwrap_or_else(|| Err("not lowered".to_string())),
+        })
+        .collect()
+}
+
+type Budgeted = (usize, Duration);
+
+/// Lower `entries` (plan index, time left) with `jobs` workers; returns the
+/// results (indexed like `plan`) and the entries that outgrew `memory_cap`,
+/// with the time they have left.
+fn lower_pass(
+    worker: &Worker,
+    options: &LoadOptions,
+    package: &Package,
+    plan: &[PlannedEntry],
+    entries: &[Budgeted],
+    jobs: usize,
+    memory_cap: Option<u64>,
+) -> (Vec<Option<Result<String, String>>>, Vec<Budgeted>) {
+    let timed_out = || {
+        format!(
+            "lowering took longer than {}s; skipped",
+            worker.timeout.as_secs()
+        )
+    };
+    let queue = std::sync::Mutex::new(entries.iter().rev().copied().collect::<Vec<_>>());
     let results = std::sync::Mutex::new(vec![None::<Result<String, String>>; plan.len()]);
+    let deferred = std::sync::Mutex::new(Vec::new());
     let fatal = std::sync::Mutex::new(None::<String>);
     std::thread::scope(|scope| {
         for _ in 0..jobs {
             scope.spawn(|| {
                 let mut session: Option<Session> = None;
-                while let Some(index) = queue.lock().expect("queue lock").pop() {
-                    let outcome = if let Some(error) = fatal.lock().expect("fatal lock").clone() {
-                        Err(error)
-                    } else if let Some(running) = session.as_mut() {
-                        running.lower(index, worker.timeout)
-                    } else {
+                while let Some((index, budget)) = queue.lock().expect("queue lock").pop() {
+                    if let Some(error) = fatal.lock().expect("fatal lock").clone() {
+                        results.lock().expect("results lock")[index] = Some(Err(error));
+                        continue;
+                    }
+                    if session.is_none() {
                         match Session::start(worker, options, package, plan) {
-                            Ok(mut started) => {
-                                let outcome = started.lower(index, worker.timeout);
-                                session = Some(started);
-                                outcome
-                            }
+                            Ok(started) => session = Some(started),
                             Err(error) => {
                                 *fatal.lock().expect("fatal lock") = Some(error.clone());
-                                Err(error)
+                                results.lock().expect("results lock")[index] = Some(Err(error));
+                                continue;
                             }
                         }
-                    };
-                    let lowered = match outcome {
-                        Ok(lowered) => {
-                            if let Some(running) = session.as_mut() {
-                                running.lowered += 1;
-                                if running.worn_out() {
-                                    session.take().expect("running session").finish();
+                    }
+                    let running = session.as_mut().expect("running session");
+                    let started = std::time::Instant::now();
+                    let outcome = running.lower(index, budget, memory_cap);
+                    if std::env::var_os("NOIRSPECT_TRACE").is_some() {
+                        let state = match &outcome {
+                            Outcome::Done(Ok(_)) => "ok".to_string(),
+                            Outcome::Done(Err(e)) | Outcome::Failed(e) => {
+                                e.lines().next().unwrap_or_default().to_string()
+                            }
+                            Outcome::OverMemory => "over memory share".to_string(),
+                            Outcome::TimedOut => timed_out(),
+                        };
+                        let rss =
+                            resident_bytes(running.child.id()).unwrap_or_default() / (1024 * 1024);
+                        eprintln!(
+                            "noirspect: [{index}] {} {:.1}s {rss} MiB: {state}",
+                            plan[index].name,
+                            started.elapsed().as_secs_f64()
+                        );
+                    }
+                    match outcome {
+                        Outcome::Done(lowered) => {
+                            running.lowered += 1;
+                            if running.worn_out() {
+                                session.take().expect("running session").finish();
+                            }
+                            results.lock().expect("results lock")[index] = Some(lowered);
+                        }
+                        Outcome::Failed(error) => {
+                            session.take().expect("running session").kill();
+                            results.lock().expect("results lock")[index] = Some(Err(error));
+                        }
+                        Outcome::TimedOut => {
+                            session.take().expect("running session").kill();
+                            results.lock().expect("results lock")[index] = Some(Err(timed_out()));
+                        }
+                        Outcome::OverMemory => {
+                            session.take().expect("running session").kill();
+                            match budget.checked_sub(started.elapsed()) {
+                                Some(left) if left >= Duration::from_secs(1) => {
+                                    deferred.lock().expect("deferred lock").push((index, left));
+                                }
+                                _ => {
+                                    results.lock().expect("results lock")[index] =
+                                        Some(Err(timed_out()))
                                 }
                             }
-                            lowered
                         }
-                        Err(error) => {
-                            if let Some(mut dead) = session.take() {
-                                dead.kill();
-                            }
-                            Err(error)
-                        }
-                    };
-                    results.lock().expect("results lock")[index] = Some(lowered);
+                    }
                 }
                 if let Some(running) = session {
                     running.finish();
@@ -597,14 +723,9 @@ fn lower_in_workers(
             });
         }
     });
-    plan.iter()
-        .zip(results.into_inner().expect("results lock"))
-        .map(|(entry, ssa)| EntrySsa {
-            name: entry.name.clone(),
-            is_main: entry.is_main,
-            ssa: ssa.unwrap_or_else(|| Err("not lowered".to_string())),
-        })
-        .collect()
+    let mut deferred = deferred.into_inner().expect("deferred lock");
+    deferred.sort_unstable_by_key(|(index, _)| *index);
+    (results.into_inner().expect("results lock"), deferred)
 }
 
 fn display_name(root: &Path, path: &Path) -> String {

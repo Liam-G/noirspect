@@ -21,7 +21,7 @@ from source with Rust 1.89 or newer. `nargo` is not needed either way:
 noirspect builds the compiler crates of nargo 1.0.0-beta.26 into itself.
 
 ```console
-cargo install --locked --git https://github.com/Liam-G/noirspect --tag v0.2.0
+cargo install --locked --git https://github.com/Liam-G/noirspect --tag v0.2.1
 noirspect lint --program-dir examples/vulnerable
 echo $?  # 2: findings were reported
 
@@ -89,6 +89,13 @@ limit), with up to `--jobs` workers at once (the CPU count, at most 4, by
 default). An entry that runs over budget, or that the compiler cannot lower,
 is listed as skipped in every report format rather than failing the run.
 
+Some circuits need many gigabytes to compile. On Linux each worker gets a
+share of memory (half the machine divided by `--jobs`); an entry that outgrows
+it is stopped and retried at the end on its own, with most of the free memory
+and whatever is left of its time budget. On very large circuits the analysis
+summarizes values derived from more than 64 inputs and hints, which can hide
+a finding but never adds one.
+
 Use `noirspect ssa --program-dir DIR --function NAME` to see the SSA a rule
 runs on.
 
@@ -106,7 +113,7 @@ jobs:
       security-events: write
     steps:
       - uses: actions/checkout@v7
-      - uses: Liam-G/noirspect@v0.2.0
+      - uses: Liam-G/noirspect@v0.2.1
         with:
           program-dir: circuits
           args: --workspace
@@ -202,18 +209,20 @@ packages ran to completion.
 
 | Package | Entry points | Skipped | Time |
 |---|---:|---:|---:|
-| Noir standard library (beta.26) | 447 | 28 | 2 s |
+| Noir standard library (beta.26) | 447 | 28 | 13 s |
 | noir_sort | 3 | 0 | 1 s |
 | noir_check_shuffle | 4 | 0 | 1 s |
 | noir_string_search | 11 | 0 | 1 s |
 | sparse_array | 16 | 2 | 1 s |
-| noir_base64 | 19 | 0 | 13 s |
-| noir_json_parser | 104 | 10 (4 over the time budget) | 9 min |
-| noir-bignum | 915 | 44 | 39 s |
+| noir_base64 | 19 | 0 | 8 s |
+| noir_json_parser | 104 | 10 (4 over the time budget) | 9.5 min |
+| noir-bignum | 915 | 44 | 61 s |
 
-Skipped entry points are functions the compiler cannot lower as an entry point,
-or that ran over the time budget. Times are from 0.1, which compiled entry points
-one at a time; 0.2 compiles them in parallel (`--jobs`).
+Measured with 0.2.1 and the default `--jobs` (4) on a 14-core machine with
+30 GB of memory. Skipped entry points are functions the compiler cannot lower
+as an entry point, or that ran over the time budget. noir_json_parser's time
+is dominated by four benchmark circuits that each need around 10 GB and more
+than 120 seconds to compile, so they run one at a time and are then skipped.
 
 Findings in third-party code are triaged by hand and, when real, reported
 privately to the maintainers first. Per-rule precision on public code will be
